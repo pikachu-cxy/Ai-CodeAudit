@@ -1,0 +1,74 @@
+# AI Deep Audit - one-command local stack.
+# Default: SQLite in a named volume, loopback-only HTTP port, no external services.
+name: ai-deep-audit
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        # Opt-in Java deep analysis. Default 0 = no ~400 MB CodeQL CLI download.
+        INSTALL_CODEQL: ${INSTALL_CODEQL:-0}
+    image: ai-deep-audit-backend:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      AI_AUDIT_ENV_FILE: /app/.env
+      DATA_DIR: /data
+      APP_HOST: 0.0.0.0
+      APP_PORT: "8787"
+      DATABASE_BACKEND: ${DATABASE_BACKEND:-sqlite}
+      FRONTEND_BASE_URL: http://127.0.0.1:${HTTP_PORT:-8080}
+      OSV_SCANNER_PATH: /opt/scanner-tools/bin/osv-scanner
+    volumes:
+      # Persistent DB, cloned repos, uploads and generated reports.
+      - backend-data:/data
+      # Settings saved from the UI survive container recreation.
+      - ./.env:/app/.env
+    expose:
+      - "8787"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    image: ai-deep-audit-frontend:local
+    restart: unless-stopped
+    ports:
+      # Loopback only: the service is not exposed on the LAN by default.
+      - "127.0.0.1:${HTTP_PORT:-8080}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  # Optional: MySQL instead of SQLite. Enable with `--profile mysql` and set
+  # DATABASE_BACKEND=mysql plus MYSQL_* in .env.
+  mysql:
+    image: mysql:8.0
+    profiles: ["mysql"]
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change-me-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-ai_audit}
+      MYSQL_USER: ${MYSQL_USER:-ai_audit}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-change-me}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  backend-data:
+  mysql-data:

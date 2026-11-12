@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>安全审计报告</title>
+  <style>
+    :root {
+      --bg: #0b1220;
+      --panel: #111827;
+      --border: rgba(34, 211, 238, 0.12);
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --dim: #64748b;
+      --cyan: #22d3ee;
+      --critical: #dc2626;
+      --high: #f97316;
+      --medium: #eab308;
+      --low: #3b82f6;
+      --info: #64748b;
+    }
+    .js-root { display: none; }
+    html.js .js-root { display: block; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    a { color: var(--cyan); }
+    .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 64px; }
+    .kicker {
+      font-size: 10px;
+      letter-spacing: .22em;
+      text-transform: uppercase;
+      color: rgba(34, 211, 238, .75);
+      font-family: ui-monospace, Consolas, monospace;
+    }
+    h1 { margin: 6px 0 8px; font-size: 26px; }
+    .meta { color: var(--muted); font-size: 13px; }
+    .meta span { margin-right: 14px; }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 10px;
+      margin: 22px 0;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+    }
+    .card .lbl { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .08em; }
+    .card .val { font-size: 22px; font-weight: 700; font-family: ui-monospace, Consolas, monospace; margin-top: 4px; }
+    .c-CRITICAL { color: #fca5a5; }
+    .c-HIGH { color: #fdba74; }
+    .c-MEDIUM { color: #fde047; }
+    .c-LOW { color: #93c5fd; }
+    .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .chart h3 { margin: 0 0 10px; font-size: 13px; color: var(--muted); font-weight: 600; }
+    .bar { display: flex; align-items: center; gap: 8px; margin: 6px 0; font-size: 12px; }
+    .bar .n { width: 92px; color: var(--muted); flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .bar .track { flex: 1; height: 8px; background: #0f172a; border-radius: 99px; overflow: hidden; }
+    .bar .fill { height: 100%; border-radius: 99px; }
+    .bar .c { width: 36px; text-align: right; font-family: ui-monospace, Consolas, monospace; color: var(--dim); }
+    .filters {
+      display: flex; flex-wrap: wrap; gap: 10px; align-items: end;
+      margin: 8px 0 14px; padding: 12px; background: var(--panel);
+      border: 1px solid var(--border); border-radius: 10px;
+    }
+    .filters label { font-size: 11px; color: var(--dim); display: flex; flex-direction: column; gap: 4px; }
+    .filters select, .filters input {
+      background: #0b1220; color: var(--text); border: 1px solid #1e293b;
+      border-radius: 6px; padding: 6px 8px; min-width: 140px; font-size: 13px;
+    }
+    .count { font-size: 12px; color: var(--muted); margin-left: auto; padding-bottom: 4px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th {
+      text-align: left; font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
+      color: var(--dim); padding: 10px 8px; border-bottom: 1px solid var(--border);
+    }
+    td { padding: 10px 8px; border-bottom: 1px solid rgba(148,163,184,.08); vertical-align: top; }
+    tbody tr { cursor: pointer; }
+    tbody tr:hover { background: rgba(34, 211, 238, .06); }
+    .badge {
+      display: inline-block; font-size: 11px; padding: 2px 7px; border-radius: 999px;
+      border: 1px solid transparent; font-weight: 600;
+    }
+    .s-CRITICAL { background: rgba(220,38,38,.2); color: #fca5a5; border-color: rgba(220,38,38,.4); }
+    .s-HIGH { background: rgba(249,115,22,.2); color: #fdba74; border-color: rgba(249,115,22,.4); }
+    .s-MEDIUM { background: rgba(234,179,8,.18); color: #fde047; border-color: rgba(234,179,8,.35); }
+    .s-LOW { background: rgba(59,130,246,.18); color: #93c5fd; border-color: rgba(59,130,246,.35); }
+    .s-INFO, .s-UNKNOWN { background: rgba(100,116,139,.2); color: #cbd5e1; }
+    .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: var(--muted); }
+    .title { color: var(--text); }
+    .empty { text-align: center; color: var(--dim); padding: 36px 0; }
+    .modal-bg {
+      display: none; position: fixed; inset: 0; background: rgba(0,0,0,.65);
+      z-index: 40; align-items: center; justify-content: center; padding: 20px;
+    }
+    .modal-bg.open { display: flex; }
+    .modal {
+      width: min(760px, 100%); max-height: min(88vh, 900px); overflow: auto;
+      background: #0f172a; border: 1px solid var(--border); border-radius: 12px; padding: 20px 22px;
+    }
+    .modal h2 { margin: 8px 0 6px; font-size: 18px; }
+    .modal .row { margin: 10px 0; }
+    .modal .lbl { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; }
+    .modal pre {
+      background: #020617; border: 1px solid #1e293b; border-radius: 8px;
+      padding: 10px; overflow: auto; font-size: 12px; color: #cbd5e1; white-space: pre-wrap;
+    }
+    .close {
+      float: right; background: transparent; border: 1px solid #334155; color: var(--muted);
+      border-radius: 6px; padding: 4px 10px; cursor: pointer;
+    }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 12px; }
+    tr.group-row { cursor: default; background: rgba(34, 211, 238, .08); }
+    tr.group-row:hover { background: rgba(34, 211, 238, .12); }
+    tr.group-row td {
+      font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+      color: var(--cyan); font-weight: 600; padding: 8px;
+    }
+    .scope {
+      display: inline-block; font-size: 11px; padding: 3px 9px; border-radius: 999px;
+      border: 1px solid rgba(34, 211, 238, .35); background: rgba(34, 211, 238, .1);
+      color: var(--cyan); margin-left: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap js-root">
+    <p class="kicker">Security Audit Report</p>
+    <h1 id="proj-title">安全审计报告</h1>
+    <p class="meta" id="proj-meta"></p>
+    <p class="meta" id="proj-link"></p>
+
+    <div class="cards" id="cards"></div>
+    <div class="charts" id="charts"></div>
+
+    <div class="filters" id="filters" hidden>
+      <label>危害
+        <select id="f-sev"><option value="">全部</option></select>
+      </label>
+      <label>漏洞类型
+        <select id="f-cat"><option value="">全部</option></select>
+      </label>
+      <label>漏洞来源
+        <select id="f-tool"><option value="">全部</option></select>
+      </label>
+      <label>关键词
+        <input id="f-q" type="search" placeholder="标题 / 规则 / 路径" />
+      </label>
+      <div class="count" id="shown-count"></div>
+    </div>
+
+    <div class="card" style="overflow:auto; padding: 0;">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>危害</th>
+            <th>漏洞描述</th>
+            <th>类型</th>
+            <th>来源</th>
+            <th>位置</th>
+            <th>AI 判定</th>
+            <th>人工标记</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+      <p class="empty" id="empty" hidden>没有匹配的漏洞</p>
+    </div>
+  </div>
+
+  <div class="modal-bg" id="modal-bg" role="dialog" aria-modal="true">
+    <div class="modal">
+      <button class="close" type="button" id="modal-close">关闭</button>
+      <div id="modal-body"></div>
+    </div>
+  </div>
+
+  <script id="report-data" type="application/json">/*__REPORT_DATA__*/</script>
+  <script>
+  (function () {
+    var SOURCE = { sast: "SAST", llm: "LLM" };
+    var OWASP = {
+      A01: "A01 访问控制失效",
+      A02: "A02 加密机制失效",
+      A03: "A03 注入",
+      A04: "A04 不安全设计",
+      A05: "A05 安全配置错误",
+      A06: "A06 易受攻击和过时的组件",
+      A07: "A07 身份识别和身份验证失败",
+      A08: "A08 软件和数据完整性失效",
+      A09: "A09 安全日志和监控失效",
+      A10: "A10 服务端请求伪造 (SSRF)",
+      OTHER: "OTHER 未分类"
+    };
+    var VER = { real_vuln: "真实漏洞", false_positive: "误报", uncertain: "待确认", pending: "待分析", skipped: "已跳过" };
+    var REV = { unreviewed: "未标记", confirmed: "确认", false_positive: "误报", fixed: "已修复" };
+    var RET = { fixed: "已修复", still_present: "仍然存在", inconclusive: "无法确认", skipped: "已跳过" };
+    var EXT = { unreviewed: "未复核", vuln_exists: "确认存在", false_positive: "误报", fixed_claimed: "声称已修复" };
+    var SEV_COLOR = { CRITICAL: "#dc2626", HIGH: "#f97316", MEDIUM: "#eab308", LOW: "#3b82f6", INFO: "#64748b", UNKNOWN: "#475569" };
+    var SOURCE_COLOR = { sast: "#3b82f6", llm: "#a855f7" };
+    var OWASP_COLOR = {
+      A01: "#f43f5e", A02: "#f59e0b", A03: "#ef4444", A04: "#a855f7", A05: "#f97316",
+      A06: "#eab308", A07: "#ec4899", A08: "#6366f1", A09: "#06b6d4", A10: "#14b8a6", OTHER: "#64748b"
+    };
+
+    function esc(s) {
+      return String(s == null ? "" : s)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+    function enumVal(v) { return v && v.value ? v.value : (v || ""); }
+    function badge(sev) {
+      var s = enumVal(sev) || "UNKNOWN";
+      return '<span class="badge s-' + esc(s) + '">' + esc(s) + "</span>";
+    }
+
+    var raw = document.getElementById("report-data").textContent;
+    document.documentElement.classList.add("js");
+    var data;
+    try { data = JSON.parse(raw); } catch (e) {
+      document.getElementById("proj-title").textContent = "报告数据无效";
+      return;
+    }
+    var meta = data.meta || {};
+    var stats = data.stats || {};
+    var findings = data.findings || [];
+    var byId = {};
+    findings.forEach(function (f) { byId[f.id] = f; });
+
+    document.title = "安全审计报告 - " + (meta.project_name || "");
+    document.getElementById("proj-title").textContent = meta.title || meta.project_name || "安全审计报告";
+    document.getElementById("proj-meta").innerHTML =
+      "<span>扫描 #" + esc(meta.scan_id) + " / " + esc(meta.scan_name) + "</span>" +
+      "<span>分支 " + esc(meta.branch || "-") + "</span>" +
+      (meta.version ? "<span>版本 " + esc(meta.version) + "</span>" : "") +
+      "<span>创建 " + esc(meta.created_at || "-") + "</span>" +
+      "<span>完成 " + esc(meta.completed_at || "-") + "</span>";
+    if (meta.scope_label) {
+      var scopeEl = document.createElement("span");
+      scopeEl.className = "scope";
+      scopeEl.textContent = meta.scope_label;
+      document.getElementById("proj-title").insertAdjacentElement("afterend", scopeEl);
+    }
+    if (meta.online_url) {
+      document.getElementById("proj-link").innerHTML =
+        '在线详情：<a href="' + esc(meta.online_url) + '">' + esc(meta.online_url) + "</a>";
+    }
+
+    var sev = stats.by_severity || {};
+    function card(label, val, cls) {
+      return '<div class="card"><div class="lbl">' + esc(label) + '</div><div class="val ' + (cls || "") + '">' + esc(val) + "</div></div>";
+    }
+    document.getElementById("cards").innerHTML =
+      card("总计", stats.total || 0) +
+      card("Critical", sev.CRITICAL || 0, "c-CRITICAL") +
+      card("High", sev.HIGH || 0, "c-HIGH") +
+      card("Medium", sev.MEDIUM || 0, "c-MEDIUM") +
+      card("Low", sev.LOW || 0, "c-LOW");
+
+    function bars(title, entries, colorFn) {
+      var max = 1;
+      entries.forEach(function (e) { if (e[1] > max) max = e[1]; });
+      var html = '<div class="card chart"><h3>' + esc(title) + "</h3>";
+      if (!entries.length) html += '<p class="empty" style="padding:8px 0">无</p>';
+      entries.forEach(function (e) {
+        var pct = Math.max(4, Math.round(100 * e[1] / max));
+        var color = colorFn(e[0]);
+        html += '<div class="bar"><div class="n" title="' + esc(e[0]) + '">' + esc(e[2] || e[0]) +
+          '</div><div class="track"><div class="fill" style="width:' + pct + "%;background:" + color +
+          '"></div></div><div class="c">' + e[1] + "</div></div>";
+      });
+      return html + "</div>";
+    }
+    var sevBars = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNKNOWN"]
+      .filter(function (k) { return sev[k]; })
+      .map(function (k) { return [k, sev[k], k]; });
+    var sourceCounts = { sast: 0, llm: 0 };
+    findings.forEach(function (f) {
+      var src = f.source || "sast";
+      sourceCounts[src] = (sourceCounts[src] || 0) + 1;
+    });
+    var sourceBars = ["sast", "llm"]
+      .map(function (k) { return [k, sourceCounts[k] || 0, SOURCE[k] || k]; })
+      .filter(function (e) { return e[1] > 0; });
+    var owaspMap = stats.by_owasp || {};
+    var owaspBars = ["A01","A02","A03","A04","A05","A06","A07","A08","A09","A10","OTHER"]
+      .map(function (k) { return [k, owaspMap[k] || 0, OWASP[k] || k]; })
+      .filter(function (e) { return e[1] > 0; });
+    var toolMap = stats.by_tool || {};
+    var toolBars = Object.keys(toolMap).map(function (k) { return [k, toolMap[k], k]; })
+      .sort(function (a, b) { return b[1] - a[1]; });
+    var TOOL_COLORS = ["#22d3ee", "#818cf8", "#34d399", "#f472b6", "#fbbf24", "#60a5fa"];
+    document.getElementById("charts").innerHTML =
+      bars("危害级别分布", sevBars, function (k) { return SEV_COLOR[k] || "#64748b"; }) +
+      bars("漏洞来源分布", sourceBars, function (k) { return SOURCE_COLOR[k] || "#64748b"; }) +
+      bars("OWASP Top 10 分布", owaspBars, function (k) { return OWASP_COLOR[k] || "#64748b"; }) +
+      bars("扫描器来源分布", toolBars, function (k, i) {
+        var idx = toolBars.findIndex(function (t) { return t[0] === k; });
+        return TOOL_COLORS[idx % TOOL_COLORS.length];
+      });
+
+    var sevs = {}, owasps = {}, sources = {};
+    findings.forEach(function (f) {
+      sevs[f.severity] = 1;
+      owasps[f.owasp_id || "OTHER"] = 1;
+      sources[f.source || "sast"] = 1;
+    });
+    var fSev = document.getElementById("f-sev");
+    var fCat = document.getElementById("f-cat");
+    var fTool = document.getElementById("f-tool");
+    Object.keys(sevs).sort().forEach(function (k) {
+      fSev.insertAdjacentHTML("beforeend", '<option value="' + esc(k) + '">' + esc(k) + "</option>");
+    });
+    ["A01","A02","A03","A04","A05","A06","A07","A08","A09","A10","OTHER"].forEach(function (k) {
+      if (owasps[k]) fCat.insertAdjacentHTML("beforeend", '<option value="' + esc(k) + '">' + esc(OWASP[k] || k) + "</option>");
+    });
+    ["sast", "llm"].forEach(function (k) {
+      if (sources[k]) fTool.insertAdjacentHTML("beforeend", '<option value="' + esc(k) + '">' + esc(SOURCE[k] || k) + "</option>");
+    });
+    document.getElementById("filters").hidden = false;
+
+    function loc(f) {
+      return (f.file_path || "") + (f.line_start ? (":" + f.line_start) : "");
+    }
+    function match(f) {
+      if (fSev.value && f.severity !== fSev.value) return false;
+      if (fCat.value && (f.owasp_id || "OTHER") !== fCat.value) return false;
+      if (fTool.value && (f.source || "sast") !== fTool.value) return false;
+      var q = (document.getElementById("f-q").value || "").trim().toLowerCase();
+      if (!q) return true;
+      return [f.title, f.message, f.rule_id, f.file_path, String(f.id)].join(" ").toLowerCase().indexOf(q) >= 0;
+    }
+    var GROUP_BY = meta.group_by || "none";
+    var SEV_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNKNOWN"];
+
+    function groupKey(f) {
+      if (GROUP_BY === "severity") return f.severity || "UNKNOWN";
+      if (GROUP_BY === "owasp") return (f.owasp_id || "OTHER") + " " + (OWASP[f.owasp_id || "OTHER"] || "");
+      if (GROUP_BY === "file") return f.file_path || "-";
+      if (GROUP_BY === "tool") return f.tool || "-";
+      return "";
+    }
+    function groupRows(rows) {
+      if (GROUP_BY === "none" || !rows.length) return rows;
+      var buckets = {};
+      var order = [];
+      rows.forEach(function (f) {
+        var k = groupKey(f);
+        if (!buckets[k]) { buckets[k] = []; order.push(k); }
+        buckets[k].push(f);
+      });
+      if (GROUP_BY === "severity") {
+        order.sort(function (a, b) {
+          var ia = SEV_ORDER.indexOf(a), ib = SEV_ORDER.indexOf(b);
+          return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+        });
+      } else {
+        order.sort(function (a, b) { return buckets[b].length - buckets[a].length; });
+      }
+      var out = [];
+      order.forEach(function (k) {
+        out.push({ __group: k, __count: buckets[k].length });
+        buckets[k].forEach(function (f) { out.push(f); });
+      });
+      return out;
+    }
+
+    function renderTable() {
+      var rows = findings.filter(match);
+      document.getElementById("shown-count").textContent = "当前 " + rows.length + " / " + findings.length + " 条";
+      var tb = document.getElementById("tbody");
+      var empty = document.getElementById("empty");
+      if (!rows.length) {
+        tb.innerHTML = "";
+        empty.hidden = false;
+        return;
+      }
+      empty.hidden = true;
+      tb.innerHTML = groupRows(rows).map(function (f) {
+        if (f.__group !== undefined) {
+          return '<tr class="group-row"><td colspan="8">' + esc(f.__group) + "（" + f.__count + " 条）</td></tr>";
+        }
+        return "<tr data-id=\"" + f.id + "\">" +
+          "<td class=\"mono\">#" + f.id + "</td>" +
+          "<td>" + badge(f.severity) + "</td>" +
+          "<td class=\"title\">" + esc(f.title || "") + "</td>" +
+          "<td>" + esc(OWASP[f.owasp_id || "OTHER"] || f.owasp_id || "OTHER") + "</td>" +
+          "<td class=\"mono\">" + esc(SOURCE[f.source || "sast"] || f.source || "") + "</td>" +
+          "<td class=\"mono\">" + esc(loc(f)) + "</td>" +
+          "<td>" + esc(VER[f.ai_verdict] || f.ai_verdict || "") + "</td>" +
+          "<td>" + esc(REV[f.review_status] || f.review_status || "") + "</td>" +
+          "</tr>";
+      }).join("");
+    }
+    ["f-sev", "f-cat", "f-tool", "f-q"].forEach(function (id) {
+      document.getElementById(id).addEventListener("input", renderTable);
+      document.getElementById(id).addEventListener("change", renderTable);
+    });
+    renderTable();
+
+    function findingUrl(f) {
+      var u = meta.online_url || "";
+      if (!u) return "";
+      var join = u.indexOf("?") >= 0 ? "&" : "?";
+      return u + join + "findingId=" + f.id;
+    }
+    function openModal(f) {
+      var html = '<p class="kicker">Finding #' + esc(f.id) + "</p>" +
+        '<div class="chips">' + badge(f.severity) +
+        '<span class="badge">' + esc(SOURCE[f.source || "sast"] || f.source || "") + "</span>" +
+        '<span class="badge">' + esc(f.tool || "") + "</span>" +
+        '<span class="badge">' + esc(OWASP[f.owasp_id || "OTHER"] || (f.owasp_id || "OTHER")) + "</span>" +
+        "</div>" +
+        "<h2>" + esc(f.title || "") + "</h2>" +
+        '<p class="mono">' + esc(loc(f)) + "</p>" +
+        '<div class="row"><div class="lbl">规则</div><div class="mono">' + esc(f.rule_id || "") + "</div></div>" +
+        '<div class="row"><div class="lbl">问题说明</div><div>' + esc(f.message || "").replace(/\n/g, "<br>") + "</div></div>" +
+        (f.snippet ? '<div class="row"><div class="lbl">代码片段</div><pre>' + esc(f.snippet) + "</pre></div>" : "") +
+        '<div class="row"><div class="lbl">AI 判定</div><div>' + esc(VER[f.ai_verdict] || f.ai_verdict || "") +
+        (f.ai_confidence != null ? "（置信度 " + Math.round(f.ai_confidence * 100) + "%）" : "") + "</div>" +
+        (f.ai_reason ? '<p style="margin:8px 0 0;color:#cbd5e1;white-space:pre-wrap">' + esc(f.ai_reason) + "</p>" : "") +
+        "</div>" +
+        '<div class="row"><div class="lbl">人工标记</div><div>' + esc(REV[f.review_status] || f.review_status || "") + "</div>" +
+        (f.review_note ? '<p style="margin:8px 0 0;color:#cbd5e1;white-space:pre-wrap">' + esc(f.review_note) + "</p>" : "") +
+        "</div>" +
+        (f.vuln_subtype || f.vuln_subtype_name
+          ? '<div class="row"><div class="lbl">漏洞子类型</div><div>' + esc(f.vuln_subtype_name || f.vuln_subtype) + "</div></div>"
+          : "") +
+        (f.external_status
+          ? '<div class="row"><div class="lbl">外部复核</div><div>' + esc(EXT[f.external_status] || f.external_status) +
+            (f.external_note ? '<p style="margin:8px 0 0;color:#cbd5e1;white-space:pre-wrap">' + esc(f.external_note) + "</p>" : "") + "</div></div>"
+          : "") +
+        (f.retest
+          ? '<div class="row"><div class="lbl">复测结论</div><div>' +
+            esc(RET[f.retest.verdict] || f.retest.verdict || "-") +
+            '<span class="mono" style="margin-left:8px">' + esc(f.retest.method || "") + " · " + esc(f.retest.created_at || "") + "</span></div></div>"
+          : "") +
+        (f.remediation
+          ? '<div class="row"><div class="lbl">修复建议</div><div style="color:#cbd5e1;white-space:pre-wrap">' + esc(f.remediation) + "</div></div>"
+          : "") +
+        (f.poc
+          ? '<div class="row"><div class="lbl">验证 PoC</div><div>' +
+            (f.poc.title ? "<p style=\"margin:0 0 6px;color:#cbd5e1\">" + esc(f.poc.title) + "</p>" : "") +
+            (f.poc.poc_type ? '<span class="badge">' + esc(f.poc.poc_type) + "</span>" : "") +
+            (f.poc.prerequisites ? '<p style="margin:8px 0 0;color:#cbd5e1"><b>前置条件：</b>' + esc(f.poc.prerequisites) + "</p>" : "") +
+            (f.poc.steps ? '<p style="margin:8px 0 0;color:#cbd5e1;white-space:pre-wrap"><b>步骤：</b>' + esc(f.poc.steps) + "</p>" : "") +
+            (f.poc.poc_content ? "<pre>" + esc(f.poc.poc_content) + "</pre>" : "") +
+            (f.poc.expected_result ? '<p style="margin:8px 0 0;color:#cbd5e1"><b>预期结果：</b>' + esc(f.poc.expected_result) + "</p>" : "") +
+            (f.poc.safety_note ? '<p style="margin:8px 0 0;color:#fbbf24"><b>安全提示：</b>' + esc(f.poc.safety_note) + "</p>" : "") +
+            "</div></div>"
+          : "");
+      var href = findingUrl(f);
+      if (href) html += '<p class="row"><a href="' + esc(href) + '">在系统中打开</a></p>';
+      document.getElementById("modal-body").innerHTML = html;
+      document.getElementById("modal-bg").classList.add("open");
+    }
+    document.getElementById("tbody").addEventListener("click", function (ev) {
+      var tr = ev.target.closest("tr");
+      if (!tr) return;
+      var f = byId[tr.getAttribute("data-id")];
+      if (f) openModal(f);
+    });
+    function closeModal() { document.getElementById("modal-bg").classList.remove("open"); }
+    document.getElementById("modal-close").addEventListener("click", closeModal);
+    document.getElementById("modal-bg").addEventListener("click", function (ev) {
+      if (ev.target.id === "modal-bg") closeModal();
+    });
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape") closeModal();
+    });
+  })();
+  </script>
+  <noscript>
+    <div class="wrap">
+      <!--__STATIC_FALLBACK__-->
+    </div>
+  </noscript>
+</body>
+</html>

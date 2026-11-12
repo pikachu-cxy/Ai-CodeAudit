@@ -1,0 +1,22 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+sqlalchemy==2.0.41
+aiosqlite==0.20.0
+asyncmy==0.2.10
+httpx==0.28.1
+pydantic-settings==2.7.0
+openai==1.58.1
+aiofiles==24.1.0
+python-dotenv==1.0.1
+PyJWT==2.13.0
+bcrypt==5.0.0
+bandit==1.8.3
+pip-audit==2.9.0
+PyYAML==6.0.2
+weasyprint==62.3
+# weasyprint 62.3 only declares `pydyf>=0.10.0` with no upper bound, but pydyf
+# 0.11+ changed the Stream API and breaks PDF export with:
+#   AttributeError: 'super' object has no attribute 'transform'
+# Pin the last compatible release; drop this pin after upgrading weasyprint.
+pydyf==0.10.0

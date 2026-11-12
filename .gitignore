@@ -1,0 +1,49 @@
+# Local secrets - never commit
+.env
+.env.*
+!.env.example
+!backend/.env.example
+!backend/.env.production.example
+!frontend/.env.example
+!frontend/.env.development
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Runtime data / caches / build output
+# NOTE: anchor runtime data dirs to the repo root. A bare `data/` matches ANY
+# directory level and would silently drop backend/app/data/dep_exploit_kb/,
+# which is a shipped runtime knowledge base required by the dep_exploit scanner.
+/data/
+/backend/data/
+/frontend/data/
+/frontend/dist/
+/frontend/node_modules/
+node_modules/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.tsbuildinfo
+*.log
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+.tmp-*
+.test-token.txt
+coverage/
+playwright-report/
+test-results/
+ui-shots/
+private/
+*.local.md
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

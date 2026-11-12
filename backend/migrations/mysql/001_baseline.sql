@@ -1,0 +1,3 @@
+-- 001_baseline.sql
+-- Baseline marker: tables are created by SQLAlchemy create_all from app/models.py.
+-- Fresh installs and upgrades record version 001 before later migrations run.

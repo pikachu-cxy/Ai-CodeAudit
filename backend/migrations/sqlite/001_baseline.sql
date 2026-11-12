@@ -1,0 +1,2 @@
+-- 001_baseline.sql
+-- Baseline marker: tables are created by SQLAlchemy create_all from app/models.py.

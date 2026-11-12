@@ -1,0 +1,35 @@
+# Build context is the repo root. Keep secrets, VCS data and caches out.
+# NOTE: keep patterns explicit with **/ prefixes - a bare "scripts/" or "*.md"
+# has ambiguous parent-directory matching semantics across Docker versions.
+.git
+**/.git
+**/__pycache__
+**/*.py[cod]
+**/node_modules
+**/dist
+**/*.log
+**/*.tsbuildinfo
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.sqlite
+**/*.sqlite3
+**/*.pem
+**/*.key
+**/*.p12
+**/*.p12
+.env
+.env.*
+!.env.example
+**/.env.local
+**/.env.*.local
+data/
+backend/data/
+frontend/data/
+backend/tests/
+**/coverage/
+**/playwright-report/
+**/test-results/
+**/ui-shots/
+# DO NOT exclude backend/scripts/ (install-scanner-tools.sh is COPYed by the Dockerfile).
+# DO NOT exclude backend/app/data/ (dep_exploit_kb YAML is a runtime asset).
