@@ -2,15 +2,26 @@
 
 from __future__ import annotations
 
+
 import logging
 
-from sqlalchemy import select, text
+from sqlalchemy import inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from app.models import Project, ScanSource, ScanTask
 from app.services.url_normalize import try_normalize_gitlab_url
 
 logger = logging.getLogger(__name__)
+
+
+async def apply_011_agent_specialties(conn: AsyncConnection) -> None:
+    """Add an optional JSON list to existing Agent registries."""
+    def add_column(connection):
+        columns = inspect(connection).get_columns("agent_definitions")
+        if not any(column["name"] == "specialties" for column in columns):
+            connection.execute(text("ALTER TABLE agent_definitions ADD COLUMN specialties JSON"))
+
+    await conn.run_sync(add_column)
 
 
 async def apply_004_notify_emails_suppressions(conn: AsyncConnection) -> None:

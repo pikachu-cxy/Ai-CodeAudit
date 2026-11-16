@@ -8,6 +8,8 @@ is persisted on ``AuditRun.budget_usage`` so a restart can recover it.
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -38,6 +40,10 @@ class BudgetExceeded(RuntimeError):
         self.limit = limit
         self.used = used
         super().__init__(f"深度审计预算耗尽（{dimension}: {used:.0f}/{limit:.0f}）")
+
+
+class RoleBudgetExceeded(BudgetExceeded):
+    """A selected Agent has exhausted its own allocation."""
 
 
 @dataclass(frozen=True)
@@ -159,6 +165,8 @@ class BudgetLedger:
     llm_ms: int = 0
     tool_ms: int = 0
     exhausted_dimension: str | None = None
+    role_usage: dict[str, dict[str, int]] = field(default_factory=dict)
+    _role: tuple[str, BudgetPolicy, dict[str, int]] | None = field(default=None, init=False, repr=False)
     _previous_seconds: float = 0.0
     _started: float = field(default_factory=time.monotonic, repr=False)
 
@@ -182,9 +190,48 @@ class BudgetLedger:
                 setattr(ledger, key, max(0, int(data.get(key) or 0)))
             except (TypeError, ValueError):
                 pass
+        ledger.role_usage = {key: dict(usage) for key, usage in data.get("role_usage", {}).items()}
         ledger.exhausted_dimension = data.get("exhausted_dimension") or None
         ledger._previous_seconds = max(0.0, float(data.get("elapsed_seconds") or 0))
         return ledger
+
+    def _counters(self) -> dict[str, int]:
+        return {"llm_rounds": self.llm_rounds, "tool_calls": self.tool_calls, "total_tokens": self.total_tokens}
+
+    @contextmanager
+    def for_role(self, slug: str, policy: BudgetPolicy) -> Iterator[None]:
+        self._role = (slug, policy, self._counters())
+        try:
+            yield
+        finally:
+            self.role_usage = self._role_snapshot()
+            self._role = None
+
+    def _role_snapshot(self) -> dict[str, dict[str, int]]:
+        if self._role is None:
+            return self.role_usage
+        slug, _, start = self._role
+        previous = self.role_usage.get(slug, {})
+        return {**self.role_usage, slug: {
+            key: previous.get(key, 0) + value - start[key]
+            for key, value in self._counters().items()
+        }}
+
+    def _role_remaining(self, dimension: str) -> tuple[int, int]:
+        slug, policy, _ = self._role
+        limit = getattr(policy, "max_" + dimension)
+        return limit, self._role_snapshot()[slug][dimension]
+
+    def _check_role_limit(self, dimension: str, required: int = 1) -> None:
+        if self._role is not None:
+            limit, used = self._role_remaining(dimension)
+            if used + required > limit:
+                raise RoleBudgetExceeded(dimension, limit, used + max(0, required - 1))
+
+    def check_consumed_tokens(self) -> None:
+        if self.total_tokens > self.policy.max_total_tokens:
+            self._fail("total_tokens", self.policy.max_total_tokens, self.total_tokens)
+        self._check_role_limit("total_tokens", required=0)
 
     def _fail(self, dimension: str, limit: float, used: float) -> None:
         self.exhausted_dimension = dimension
@@ -204,6 +251,10 @@ class BudgetLedger:
         available = self.policy.max_total_tokens - self.total_tokens - estimated_prompt
         if available < 1:
             self._fail("total_tokens", self.policy.max_total_tokens, self.total_tokens + estimated_prompt)
+        if self._role is not None:
+            self._check_role_limit("total_tokens", estimated_prompt + 1)
+            limit, used = self._role_remaining("total_tokens")
+            available = min(available, limit - used - estimated_prompt)
         return min(4096, available)
 
     def check_llm(self) -> None:
@@ -213,10 +264,15 @@ class BudgetLedger:
         if self.total_tokens >= self.policy.max_total_tokens:
             self._fail("total_tokens", self.policy.max_total_tokens, self.total_tokens)
 
+        self._check_role_limit("llm_rounds")
+        self._check_role_limit("total_tokens")
+
     def check_tool(self) -> None:
         self.check_time()
         if self.tool_calls >= self.policy.max_tool_calls:
             self._fail("tool_calls", self.policy.max_tool_calls, self.tool_calls)
+
+        self._check_role_limit("tool_calls")
 
     def consume_llm(
         self,
@@ -253,4 +309,5 @@ class BudgetLedger:
             "tool_ms": self.tool_ms,
             "elapsed_seconds": round(self.elapsed_seconds, 3),
             "exhausted_dimension": self.exhausted_dimension,
+            "role_usage": self._role_snapshot(),
         }

@@ -2,7 +2,7 @@
 
 ## 当前开发基线
 
-2026-11-13 核对了 `pikachu-cxy/Ai-CodeAudit` 本地 `main` 与远端 `main`，两者均指向 `28b38b6f7248bf27f1c15d9c2f838f07baacc2b3`。Deep Audit V1 在本地工作树开发。此目录为包含 `backend/`、`frontend/`、`deploy/`、`scripts/` 的独立仓库。后端 FastAPI + async SQLAlchemy，前端 React + TypeScript + Vite，Docker Compose 默认 SQLite，可选 MySQL。发布快照阶段的部署细节在 `DEPLOYMENT.md`，本阶段验收以本文记录为准。
+本轮角色编排以 `pikachu-cxy/Ai-CodeAudit` 本地 `main` 的 `5a11f76` 为基线。基线核对时工作区干净。此目录为包含 `backend/`、`frontend/`、`deploy/`、`scripts/` 的独立仓库。后端 FastAPI + async SQLAlchemy，前端 React + TypeScript + Vite，Docker Compose 默认 SQLite，可选 MySQL。发布快照阶段的部署细节在 `DEPLOYMENT.md`，本阶段验收以本文记录为准。
 
 ## 代码地图
 
@@ -11,7 +11,7 @@
 | `backend/app/services/scan_service.py` | 原有 SAST 调度、Finding 保存、人工复核与评分。Deep Audit 读取既有扫描结果，人工确认复用原有复核服务。 |
 | `llm_endpoint_audit_service.py`、`llm_flow_recon_service.py` | 原有端点审计按 Origin、Understand 和领域 Goal 循环执行。数据流研判保留独立的工具循环。 |
 | `agent_chat_service.py`、`agent_tools.py`、`llm_provider.py` | 原有扫描上下文对话、源码查询和模型调用。V1 复用接口发现、符号搜索、相关文件定位、动作 JSON 解析和 Provider；Provider 的用量和禁重试选项由 V1 显式使用。 |
-| `deep_audit_service.py`、`deep_audit_planner.py`、`deep_audit_worker.py` | 调度、纯数据规划、单个通用 Worker。Worker 按任务顺序查询源码并提交事实、假设和候选。 |
+| `deep_audit_service.py`、`deep_audit_lineup.py`、`deep_audit_model_planner.py`、`deep_audit_planner.py`、`deep_audit_worker.py` | 校验并固化阵容；按选择调用 Planner 模型或运行内置规则；按擅长方向分派任务，串行查询源码并提交结论。 |
 | `deep_audit_guards.py`、`deep_audit_budget.py`、`tool_log_redaction.py` | 只读源码清单、参数与权限校验、运行预算和日志脱敏。 |
 | `blackboard_service.py`、`models.py` | 黑板数据库 API、事实与证据去重、候选关联及证据门槛。 |
 | `routers/deep_audit.py`、`routers/agents.py` | 启动、预览、读黑板、取消、恢复、复核与能力查询。 |
@@ -19,16 +19,16 @@
 
 ## 执行和权限
 
-1. 选取已结束且仍有源码的扫描，可指定一条已启用的 `AgentDefinition`。调度器验证源码位于平台仓库目录或上传目录，并准备范围内的源码清单、SAST 线索和已提取接口。
-2. Planner 接收项目、线索、同版本黑板和用户范围，按鉴权与水平越权、注入及危险数据流、业务逻辑风险生成结构化任务。规划模块是纯数据变换。相同版本下已完成的同类型、同目标任务可跳过。
-3. 单个 Worker 顺序调查。仅允许 `list_endpoints`、`list_controllers`、`search_code`、`read_file`、`read_files_batch`。目录前缀按路径段匹配，禁止越界、链接、凭据路径和超限文件。源码读取由只读能力接口执行，审计写入走数据库服务。Shell、仓库写入、任意网络工具、MCP 和 Skill 执行能力均未授权。
-4. 运行预算默认 12 个模型轮次、36 次工具调用、60000 Token、600 秒和每工具 15 秒。默认单文件 512 KiB、单窗 200 行、单次输出正文 6000 字符、批量 6 个文件、最多 6 个任务。AgentDefinition 可收紧模型轮次、工具次数、批读文件数和 Token。模型请求按完整上下文估算剩余额度，禁自动重试，返回后优先按 Provider 用量记账。预算耗尽以失败结束，已保存事实保留。
+1. 选取已结束且仍有源码的扫描，在 Agent 管理页「本次审计阵容」中选用内置规则或一个已启用的 Planner，并选择内置 Worker 或 1–3 个已启用的 Worker。Reviewer 和 Reporter 仅可登记配置。调度器验证源码位于平台仓库目录或上传目录，并准备范围内的源码清单、SAST 线索和已提取接口。
+2. Planner 接收项目、SAST、端点、同版本黑板和审计范围。自定义 Planner 使用快照中的模型和提示词，模型只收到序列化线索和允许的相对路径，没有工具权限。后端校验 JSON、方向、目标与数量，拒绝整份越界计划，再走内置规则并记录 `fallback_reason`。同版本已完成的同类型、同目标任务可跳过。
+3. 多 Agent 已接通。Worker 优先按结构化 `specialties` 匹配任务，其次使用通用 Worker，没有匹配时由所选 Worker 中分派任务较少的成员承担。任务记录保存负责的 Agent 标识；多个 Worker 按任务顺序逐个执行，多 Worker 并发尚未开启。仅允许 `list_endpoints`、`list_controllers`、`search_code`、`read_file`、`read_files_batch`。目录前缀按路径段匹配，禁止越界、链接、凭据路径和超限文件。源码读取由只读能力接口执行，审计写入走数据库服务。Shell、仓库写入、任意网络工具、MCP 和 Skill 执行能力均未授权。
+4. 运行预算默认 12 个模型轮次、36 次工具调用、60000 Token、600 秒和每工具 15 秒。默认单文件 512 KiB、单窗 200 行、单次输出正文 6000 字符、批量 6 个文件、最多 6 个任务。整次运行共享轮次、工具次数、Token 和时间上限。每个角色另有自己的累计额度，任务间和恢复时保留用量。Worker 的工具次数上限按角色轮次的三倍计算，批读范围也受角色预算约束。旧 `agent_slug` 继续保留单 Worker 和原有总预算收紧行为。模型请求按完整上下文估算剩余额度，禁自动重试，返回后优先按 Provider 用量记账。预算耗尽以失败结束，已保存事实保留。
    管理员可在「LLM 设置 → Deep Audit V1 预算」调整整次运行的 LLM 轮次、工具调用和 Token 上限。页面值保存在当前数据库，优先于环境默认值。保存后启动的新运行使用新预算，恢复运行继续使用原预算。
-5. 工具事件复用 `ScanEvent`，记录任务、工具名、结果大小、耗时和状态。取消为协作式，恢复使用原预算和版本；源码清单变化时需新开运行。单进程限制同一扫描同时运行一个 Deep Audit。
+5. 工具事件复用 `ScanEvent`，记录规划来源、回退原因、任务、Agent、工具、耗时和状态。取消为协作式；新运行恢复时沿用固化的阵容、模型、提示词、预算和代码版本。原有未保存阵容的历史运行仍用旧恢复方式。源码清单有变化时需新开运行。单进程限制同一扫描同时运行一个 Deep Audit。
 
 ## 黑板与迁移
 
-SQLite 和 MySQL 的 `010_deep_audit.sql` 新增四张表。
+SQLite 和 MySQL 的 `010_deep_audit.sql` 建立下列四张表。`011_agent_specialties` 增加 `agent_definitions.specialties` JSON 列，旧记录为空时按通用角色处理。阵容、计划结果写入原 `AuditRun.config_snapshot`，逐角色用量写入 `AuditRun.budget_usage`，任务分配使用原 `AuditTask.agent_id`。运行查询不返回自定义提示词。
 
 | 模型 | 数据 |
 | --- | --- |
@@ -47,8 +47,8 @@ SQLite 和 MySQL 的 `010_deep_audit.sql` 新增四张表。
 | --- | --- |
 | GET / PUT `/deep-audit/settings` | 管理员读取或更新 Deep Audit V1 的三个全局预算上限。 |
 | GET `/deep-audit/capabilities` | 模式、方向、工具白名单、预算、LLM 配置状态。 |
-| POST `/scans/{scan_id}/deep-audit/plan` | `focus`、`path_prefixes`、`max_tasks`。返回版本和规划任务，不持久化。 |
-| POST `/scans/{scan_id}/deep-audit/runs` | 同预览，可加 `agent_slug`。返回 201 和 Run。 |
+| POST `/scans/{scan_id}/deep-audit/plan` | `focus`、`path_prefixes`、`max_tasks`，可选 `planner_slug`、`worker_slugs`。返回版本、计划来源、回退原因和任务分配。选用 Planner 模型时会消耗该次预览的调用额度，不写入审计运行，也不启动 Worker。 |
+| POST `/scans/{scan_id}/deep-audit/runs` | 同预览。旧客户端可使用单独的 `agent_slug`，不能与新阵容字段并用。返回 201 和 Run，后台生成本次正式计划。 |
 | GET `/scans/{scan_id}/deep-audit/runs` | 扫描的运行列表。 |
 | GET `/deep-audit/runs/{run_id}` | 当前 Agent、任务、预算、事实、候选和已确认漏洞。 |
 | GET `/deep-audit/runs/{run_id}/facts` | 可按 `fact_type` 查询，包含证据。 |
@@ -56,7 +56,15 @@ SQLite 和 MySQL 的 `010_deep_audit.sql` 新增四张表。
 | POST `/deep-audit/runs/{run_id}/cancel`、`/resume` | 请求取消或恢复已中断运行。 |
 | POST `/deep-audit/runs/{run_id}/findings/{finding_id}/confirm` | 可传 `review_note`，要求该运行有对应代码证据。 |
 
-## 验收与对照
+## 本轮角色编排验收
+
+- 隔离容器运行后端完整回归，299 项中 297 项通过、2 项跳过。角色编排测试使用模型 Provider 替身验证调用的模型和提示词，仍执行真实只读文件读取。
+- 同一扫描切换到 Planner Agent 后，计划目标和优先级变化。鉴权与注入任务分给两个不同 Worker，调用顺序验证为串行。启动后停用并修改 Worker 配置，运行仍使用原模型和提示词。
+- 角色错配、重复 Worker 和新旧参数混用被拒绝。越界模型计划在预览和正式运行中均被拒绝，正式运行仅落内置规则任务，并保存回退原因。
+- 验证旧入口、无模型模式、角色与总预算恢复、已有 SQLite AgentDefinition 的迁移、黑板证据、取消恢复和人工复核。漏洞样例保留 4 条候选，安全对照为 0。
+- 前端 TypeScript、Vite 生产构建及 `docker compose build` 的两个镜像通过，仍有既有的大资源包提示。本轮未用真实外部模型检验规划质量，未连接 MySQL 实例验收迁移。
+
+## 基线验收与对照
 
 后端运行 `python -m unittest discover -s tests -q`。前端运行 `npm ci` 和 `npm run build`。容器使用 `docker compose build`，并在独立 Compose 项目和本机端口上验证。
 

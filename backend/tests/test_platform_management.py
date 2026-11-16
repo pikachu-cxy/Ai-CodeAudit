@@ -72,13 +72,12 @@ class PlatformManagementApiTests(unittest.TestCase):
             caps = await client.get("/api/agents/capabilities")
             self.assertEqual(caps.status_code, 200)
             body = caps.json()
-            # Deep Audit V1 wired a single Planner -> Worker runtime. MCP / Skill
-            # execution permission is still explicitly NOT granted.
             self.assertTrue(body["execution_wired"])
             self.assertTrue(body["scheduler"])
             self.assertTrue(body["blackboard"])
-            self.assertEqual(body["runtime_status"], "deep_audit_v1_single_worker")
-            self.assertEqual(body["deep_audit"]["worker_count"], 1)
+            self.assertEqual(body["runtime_status"], "deep_audit_v1_serial_roles")
+            self.assertEqual(body["deep_audit"]["max_workers"], 3)
+            self.assertFalse(body["deep_audit"]["parallel_workers"])
             self.assertFalse(body["deep_audit"]["mcp_tools_granted"])
             self.assertFalse(body["deep_audit"]["skills_granted"])
             self.assertTrue(body["resolved_models"]["agent"])
@@ -91,12 +90,15 @@ class PlatformManagementApiTests(unittest.TestCase):
                     "role": "worker",
                     "model_task": "agent",
                     "max_files": 24,
+                    "specialties": ["authz"],
                 },
             )
             self.assertEqual(created.status_code, 201, created.text)
             row = created.json()
             self.assertEqual(row["slug"], "code-worker")
             self.assertEqual(row["max_files"], 24)
+            self.assertEqual(row["specialties"], ["authz"])
+            self.assertEqual((await client.put(f"/api/agents/{row['id']}", json={"specialties": ["bad"]})).status_code, 422)
             self.assertTrue(row["execution_wired"])
             self.assertEqual(row["effective_model"], body["resolved_models"]["agent"])
             agent_id = row["id"]
@@ -163,6 +165,7 @@ class PlatformManagementApiTests(unittest.TestCase):
             )
             self.assertEqual(created.status_code, 201, created.text)
             self.assertEqual(created.json()["effective_model"], "my-private-model")
+            self.assertFalse(created.json()["execution_wired"])
 
         self._with_client(scenario)
 

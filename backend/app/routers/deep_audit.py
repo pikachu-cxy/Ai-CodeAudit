@@ -20,7 +20,7 @@ Routes::
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -32,8 +32,9 @@ from app.dependencies.auth import require_admin, require_auth
 from app.models import AuditRun, ScanEvent, ScanTask, dt_iso
 from app.services import blackboard_service as bb
 from app.services import deep_audit_service as svc
-from app.services.deep_audit_budget import BudgetPolicy, DeepAuditBudgetSettings, save_deep_audit_budget
+from app.services.deep_audit_budget import BudgetExceeded, BudgetPolicy, DeepAuditBudgetSettings, save_deep_audit_budget
 from app.services.deep_audit_guards import ALLOWED_TOOLS, ToolPolicyError, relative_path
+from app.services.deep_audit_lineup import public_config
 from app.services.deep_audit_planner import FOCUS_KEYS, FOCUS_LABELS, AuditScope
 from app.services.llm_provider import is_llm_configured
 
@@ -54,6 +55,10 @@ class DeepAuditScopeIn(BaseModel):
 
 class DeepAuditStartIn(DeepAuditScopeIn):
     agent_slug: str | None = Field(default=None, max_length=64)
+    planner_slug: str | None = Field(default=None, min_length=2, max_length=64)
+    worker_slugs: list[Annotated[str, Field(min_length=2, max_length=64)]] | None = Field(
+        default=None, min_length=1, max_length=3,
+    )
 
 
 class ConfirmIn(BaseModel):
@@ -87,7 +92,7 @@ def _run_out(row: AuditRun) -> dict:
         "agent_slug": row.agent_slug,
         "agent_definition_id": row.agent_definition_id,
         "repository_revision": row.repository_revision,
-        "config_snapshot": _loads(row.config_snapshot, {}),
+        "config_snapshot": public_config(_loads(row.config_snapshot, {})),
         "scope": _loads(row.scope_json, {}),
         "budget_usage": _loads(row.budget_usage, {}),
         "error_message": row.error_message,
@@ -127,9 +132,11 @@ async def deep_audit_capabilities(db: AsyncSession = Depends(get_db)) -> dict:
     return {
         "mode": "deep_audit_v1",
         "execution_wired": True,
-        "runtime_status": "deep_audit_v1_single_worker",
-        "planner": "deterministic_v1 (纯数据，无 FS / Shell / HTTP / LLM)",
+        "runtime_status": "deep_audit_v1_serial_roles",
+        "planner": "agent_llm / deterministic_v1",
         "worker_count": 1,
+        "max_workers": 3,
+        "parallel_workers": False,
         "blackboard": ["audit_runs", "audit_tasks", "audit_facts", "audit_evidence"],
         "allowed_tools": sorted(ALLOWED_TOOLS),
         "mcp_tools_granted": False,
@@ -142,7 +149,7 @@ async def deep_audit_capabilities(db: AsyncSession = Depends(get_db)) -> dict:
         "policy": policy.to_dict(),
         "legacy_llm_audit_preserved": True,
         "note": (
-            "Deep Audit V1 是可选执行模式：Planner 产出结构化任务，1 个通用 Worker 仅能调用 "
+"Deep Audit V1 由 Planner 生成结构化任务，1–3 个 Worker 串行执行，仅能调用 "
             "5 个只读代码工具。无代码证据不会创建 Finding；候选 Finding 均为 UNREVIEWED/PENDING，"
             "必须人工确认。MCP / Skill 未授予执行权限。原有扫描器与 LLM 深度审计链路保持不变。"
         ),
@@ -151,12 +158,15 @@ async def deep_audit_capabilities(db: AsyncSession = Depends(get_db)) -> dict:
 
 @router.post("/scans/{scan_id}/deep-audit/plan")
 async def plan_preview(
-    scan_id: int, body: DeepAuditScopeIn, db: AsyncSession = Depends(get_db)
+    scan_id: int, body: DeepAuditStartIn, db: AsyncSession = Depends(get_db)
 ) -> dict:
-    """Planner-only dry run: no AuditRun/Task/Fact rows, no Worker, no LLM call."""
+    """Preview the selected Planner without persisting a run or starting Workers."""
     try:
-        return await svc.plan_preview(db, scan_id, _clean_scope(body))
-    except ToolPolicyError as exc:
+        return await svc.plan_preview(
+            db, scan_id, _clean_scope(body), planner_slug=body.planner_slug,
+            worker_slugs=body.worker_slugs, agent_slug=body.agent_slug,
+        )
+    except (ToolPolicyError, BudgetExceeded) as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     except ValueError as exc:
         raise _service_error(exc) from exc
@@ -176,6 +186,8 @@ async def start_run(
             svc.DeepAuditStartOptions(
                 scan_id=scan_id,
                 agent_slug=body.agent_slug,
+                planner_slug=body.planner_slug,
+                worker_slugs=body.worker_slugs,
                 focus=list(scope.focus),
                 path_prefixes=list(scope.path_prefixes),
                 max_tasks=body.max_tasks,

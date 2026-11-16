@@ -30,6 +30,12 @@ const ROLE_LABELS: Record<string, string> = {
   reporter: "Reporter · 报告",
 };
 
+const FOCUS_OPTIONS: { key: DeepAuditFocus; label: string }[] = [
+  { key: "authz", label: "鉴权与水平越权" },
+  { key: "injection", label: "注入及危险数据流" },
+  { key: "business_logic", label: "业务逻辑风险" },
+];
+
 const EMPTY_FORM: AgentPayload = {
   slug: "",
   name: "",
@@ -39,6 +45,7 @@ const EMPTY_FORM: AgentPayload = {
   model_task: "agent",
   model_override: "",
   system_prompt: "",
+  specialties: [],
   max_tool_rounds: 10,
   max_files: 16,
   max_tokens: 8192,
@@ -62,7 +69,8 @@ export function AgentsPage(ctx: PageContext) {
     [ctx.refreshKey],
   );
   const [launchScanId, setLaunchScanId] = useState<number | null>(null);
-  const [launchAgentSlug, setLaunchAgentSlug] = useState("");
+  const [plannerSlug, setPlannerSlug] = useState("");
+  const [workerSlugs, setWorkerSlugs] = useState<string[]>([]);
   const [launchFocus, setLaunchFocus] = useState<DeepAuditFocus[]>([
     "authz",
     "injection",
@@ -92,6 +100,7 @@ export function AgentsPage(ctx: PageContext) {
       model_task: row.model_task,
       model_override: row.model_override,
       system_prompt: row.system_prompt,
+      specialties: row.specialties ?? [],
       max_tool_rounds: row.max_tool_rounds,
       max_files: row.max_files,
       max_tokens: row.max_tokens,
@@ -117,7 +126,7 @@ export function AgentsPage(ctx: PageContext) {
       ctx.onDataChanged();
       setMessage({
         tone: "success",
-        text: "Agent 配置已保存。启用后可在下方「启动 Deep Audit V1」中选中它，用于收紧唯一通用 Worker 的模型与预算；保存本身不会启动审计。",
+        text: "Agent 配置已保存。已启用的 Planner 和 Worker 可在「本次审计阵容」中选择。",
       });
     } catch (err) {
       setMessage({ tone: "error", text: `保存失败：${errorText(err)}` });
@@ -141,13 +150,17 @@ export function AgentsPage(ctx: PageContext) {
 
   const capabilities = caps.data;
   const rows = list.data ?? [];
+  const planners = rows.filter((row) => row.enabled && row.role === "planner");
+  const workers = rows.filter((row) => row.enabled && row.role === "worker");
+  const chosenPlanner = planners.find((row) => row.slug === plannerSlug);
+  const chosenWorkers = workerSlugs.filter((slug) => workers.some((row) => row.slug === slug));
 
   return (
     <div className="page-container space-y-4">
       <PageHeader
         eyebrow="Platform / Agents"
         title="Agent 配置"
-        description="维护 Agent 角色定义、模型绑定与执行预算。启用的定义可被 Deep Audit V1 选中，作用于唯一的通用 Worker；原有扫描与 LLM 链路不受影响。"
+        description="为 Deep Audit V1 配置 Planner 和 Worker 的模型、提示词与角色预算。"
         actions={
           <button type="button" className="btn-primary inline-flex items-center gap-1.5" onClick={openCreate}>
             <Plus className="h-3.5 w-3.5" /> 新增 Agent 配置
@@ -194,7 +207,7 @@ export function AgentsPage(ctx: PageContext) {
             <KeyValueRow label="可用模型绑定"><MonoMeta>{capabilities.model_tasks.join(" / ")}</MonoMeta></KeyValueRow>
             <KeyValueRow label="Worker 数量 / 模式">
               <MonoMeta>
-                {capabilities.deep_audit?.worker_count ?? 1} / {capabilities.deep_audit?.worker_mode ?? "—"}
+                1–{capabilities.deep_audit?.max_workers ?? 3} 个串行 Worker / {capabilities.deep_audit?.worker_mode ?? "—"}
               </MonoMeta>
             </KeyValueRow>
             <KeyValueRow label="MCP / Skill 授权">
@@ -209,7 +222,7 @@ export function AgentsPage(ctx: PageContext) {
 
       <SectionCard
         title="启动 Deep Audit V1"
-        description="选择一个真实扫描任务和一条已启用的 AgentDefinition。Planner 只做纯数据规划，执行由唯一的只读 Worker 完成；不会自动授权 MCP / Skill。"
+        description="选择扫描任务和本次使用的 Agent。Worker 按擅长方向分工，按顺序执行。"
       >
         <div className="grid gap-3 md:grid-cols-2">
           <Field label="扫描任务" hint="仅列出未归档的真实扫描任务。">
@@ -228,26 +241,35 @@ export function AgentsPage(ctx: PageContext) {
               ))}
             </select>
           </Field>
-          <Field label="Agent 定义" hint="只有启用状态的定义可选；留空使用内置默认 Worker。">
-            <select
-              className="input"
-              value={launchAgentSlug}
-              onChange={(event) => setLaunchAgentSlug(event.target.value)}
-            >
-              <option value="">内置默认 Worker</option>
-              {(list.data ?? []).filter((row) => row.enabled).map((row) => (
-                <option key={row.id} value={row.slug}>
-                  {row.name} · {row.slug}
-                </option>
-              ))}
+        </div>
+        <fieldset className="mt-4 grid gap-3 rounded-lg border border-surface-border p-3 md:grid-cols-2">
+          <legend className="px-1 text-sm font-medium">本次审计阵容</legend>
+          <Field label="Planner" hint="使用所选模型和提示词规划。模型不可用时使用内置规则。">
+            <select className="input" value={chosenPlanner?.slug ?? ""} onChange={(event) => setPlannerSlug(event.target.value)}>
+              <option value="">内置规则 Planner</option>
+              {planners.map((row) => <option key={row.id} value={row.slug}>{row.name} · {row.slug}</option>)}
             </select>
           </Field>
-        </div>
+          <fieldset className="space-y-2">
+            <legend className="text-xs font-medium text-[var(--text-secondary)]">Worker（最多三个，串行）</legend>
+            {workers.map((row) => (
+              <label key={row.id} className="flex items-center gap-2 text-xs">
+                <input type="checkbox" checked={chosenWorkers.includes(row.slug)}
+                  disabled={chosenWorkers.length >= 3 && !chosenWorkers.includes(row.slug)}
+                  onChange={() => setWorkerSlugs(chosenWorkers.includes(row.slug)
+                    ? chosenWorkers.filter((slug) => slug !== row.slug)
+                    : [...chosenWorkers, row.slug])} />
+                {row.name} · {FOCUS_OPTIONS.filter(({ key }) => row.specialties?.includes(key)).map(({ label }) => label).join("、") || "通用"}
+              </label>
+            ))}
+            {!chosenWorkers.length && <p className="text-xs text-[var(--text-muted)]">当前使用内置通用 Worker</p>}
+          </fieldset>
+        </fieldset>
         {launchScanId ? (
           <div className="mt-4">
             <DeepAuditLauncher
               scanId={launchScanId}
-              agentSlug={launchAgentSlug || undefined}
+              lineup={{ planner_slug: chosenPlanner?.slug, worker_slugs: chosenWorkers.length ? chosenWorkers : undefined }}
               focus={launchFocus}
               onFocusChange={setLaunchFocus}
               onStarted={(runId) => {
@@ -407,22 +429,38 @@ export function AgentsPage(ctx: PageContext) {
               </Field>
             </div>
             <div className="md:col-span-2">
-              <Field label="系统提示词" hint="Deep Audit V1 会将此文本作为附加指令传给唯一的通用 Worker；仍受只读工具白名单与硬预算约束。">
+              <Field label="系统提示词" hint="审计启动后，所选角色会使用这段提示词和它自己的模型。">
                 <textarea className="input min-h-[110px] font-mono text-xs" value={form.system_prompt} onChange={(e) => set({ system_prompt: e.target.value })} placeholder="You are a code audit worker…" />
               </Field>
             </div>
-            <Field label="最大文件数" hint="1–200">
+            {form.role === "worker" && (
+              <fieldset className="space-y-2 md:col-span-2">
+                <legend className="text-xs font-medium text-[var(--text-secondary)]">擅长方向（留空表示通用）</legend>
+                <div className="flex flex-wrap gap-3">
+                  {FOCUS_OPTIONS.map(({ key, label }) => (
+                    <label key={key} className="flex items-center gap-1.5 text-xs">
+                      <input type="checkbox" checked={form.specialties.includes(key)}
+                        onChange={() => set({ specialties: form.specialties.includes(key)
+                          ? form.specialties.filter((item) => item !== key)
+                          : [...form.specialties, key] })} />
+                      {label}
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
+            )}
+            <Field label="单次批读文件数" hint="Worker 使用，仍受系统上限约束。">
               <input className="input" type="number" min={1} max={200} value={form.max_files} onChange={(e) => set({ max_files: Number(e.target.value) })} />
             </Field>
-            <Field label="最大工具轮次" hint="1–50">
+            <Field label="角色最大 LLM 轮次" hint="1–50。Worker 的工具次数上限最多为此值的 3 倍。">
               <input className="input" type="number" min={1} max={50} value={form.max_tool_rounds} onChange={(e) => set({ max_tool_rounds: Number(e.target.value) })} />
             </Field>
-            <Field label="最大 tokens" hint="256–200000">
+            <Field label="角色最大 Token" hint="256–200000。角色用量也计入整次审计预算。">
               <input className="input" type="number" min={256} max={200000} value={form.max_tokens} onChange={(e) => set({ max_tokens: Number(e.target.value) })} />
             </Field>
             <label className="flex items-center gap-2 self-end pb-2 text-xs text-[var(--text-secondary)]">
               <input type="checkbox" checked={form.enabled} onChange={(e) => set({ enabled: e.target.checked })} />
-              启用此配置记录（可在启动 Deep Audit 时被选中，不会自动执行）
+              启用此配置记录
             </label>
           </div>
         </Modal>

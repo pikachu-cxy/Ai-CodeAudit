@@ -34,7 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import AuditFact, AuditRun, AuditTask, ScanEvent
 from app.services import blackboard_service as bb
 from app.services.agent_tools import audit_tool_specs, parse_agent_response
-from app.services.deep_audit_budget import BudgetExceeded, BudgetLedger, BudgetPolicy
+from app.services.deep_audit_budget import BudgetLedger, BudgetPolicy
 from app.services.deep_audit_guards import (
     ALLOWED_TOOLS, ReadOnlyRepository, ToolPolicyError, execute_read_only_tool,
 )
@@ -544,7 +544,7 @@ async def _llm_investigation(
     messages: list[dict] = [{"role": "system", "content": system}]
     model_task = None if not agent or getattr(agent, "model_task", "agent") == "default" else agent.model_task
     model = (getattr(agent, "model_override", "") or "").strip() or None
-    extra_prompt = (getattr(agent, "system_prompt", "") or "").strip()[:4000]
+    extra_prompt = (getattr(agent, "system_prompt", "") or "").strip()
     if extra_prompt:
         messages.append({"role": "system", "content": f"AgentDefinition 附加指示：\n{extra_prompt}"})
     messages.append({"role": "user", "content": "请开始调查，先调用只读工具取得代码证据。"})
@@ -574,6 +574,7 @@ async def _llm_investigation(
             )
             await bb.update_run(db, run, budget_usage=ledger.snapshot())
             ledger.check_time()
+            ledger.check_consumed_tokens()
             cancel_check()
             logger.warning("Deep Audit LLM call failed: %s", type(exc).__name__)
             outcome.notes.append(f"LLM 调用失败，改用确定性只读调查：{type(exc).__name__}")
@@ -592,9 +593,7 @@ async def _llm_investigation(
         )
         await bb.update_run(db, run, budget_usage=ledger.snapshot())
         ledger.check_time()
-        if ledger.total_tokens > policy.max_total_tokens:
-            ledger.exhausted_dimension = "total_tokens"
-            raise BudgetExceeded("total_tokens", policy.max_total_tokens, ledger.total_tokens)
+        ledger.check_consumed_tokens()
         cancel_check()
         outcome.llm_rounds += 1
 
@@ -662,12 +661,13 @@ async def run_worker_task(
     """Execute one Planner task with one general-purpose Worker."""
     if cancel_check is None:
         cancel_check = lambda: None
-    agent_slug = run.agent_slug or "deep-audit-worker"
+    agent_slug = task.agent_id or run.agent_slug or "deep-audit-worker"
     outcome = WorkerOutcome()
     await log_event(
         db, run.scan_id, "task_started",
         {"run_id": run.id, "task_id": task.id, "task_type": task.task_type, "agent": agent_slug,
-         "mode": "llm" if use_llm else "deterministic"},
+         "mode": "llm" if use_llm else "deterministic",
+         "model": getattr(agent, "model_override", None) if use_llm else None},
     )
     if use_llm:
         await _llm_investigation(

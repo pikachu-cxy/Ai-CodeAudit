@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import shutil
 import tempfile
 import unittest
@@ -9,16 +10,17 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import settings
 from app.database import Base, get_db
 from app.dependencies.auth import require_auth
 from app.main import app
+from app.migrations.hooks import apply_011_agent_specialties
 from app.models import AgentDefinition, AuditEvidence, AuditFact, Finding, ScanSource, ScanStatus, ScanTask
-from app.services import blackboard_service, deep_audit_service, deep_audit_worker, scan_service
-from app.services.deep_audit_budget import BudgetExceeded, BudgetLedger, BudgetPolicy
+from app.services import blackboard_service, deep_audit_model_planner, deep_audit_service, deep_audit_worker, scan_service
+from app.services.deep_audit_budget import BudgetExceeded, BudgetLedger, BudgetPolicy, RoleBudgetExceeded
 from app.services.deep_audit_guards import ReadOnlyRepository, ToolPolicyError, execute_read_only_tool
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -72,6 +74,151 @@ class DeepAuditTests(unittest.IsolatedAsyncioTestCase):
         if task:
             await asyncio.wait_for(asyncio.shield(task), timeout=15)
         return run_id, (await self.client.get(f"/api/deep-audit/runs/{run_id}")).json()
+
+    async def test_upgrade_existing_agent_definitions(self):
+        old_engine = create_async_engine("sqlite+aiosqlite://")
+        self.addAsyncCleanup(old_engine.dispose)
+        async with old_engine.begin() as conn:
+            await conn.execute(text("CREATE TABLE agent_definitions (id INTEGER PRIMARY KEY, slug TEXT)"))
+            await conn.execute(text("INSERT INTO agent_definitions VALUES (1, 'existing-worker')"))
+            await apply_011_agent_specialties(conn)
+            await apply_011_agent_specialties(conn)
+            row = (await conn.execute(text("SELECT id, slug, specialties FROM agent_definitions"))).one()
+            self.assertEqual(tuple(row), (1, "existing-worker", None))
+
+    def test_role_budget_is_restored_and_shared_budget_still_applies(self):
+        policy = BudgetPolicy(max_llm_rounds=3)
+        role = BudgetPolicy(max_llm_rounds=1)
+        ledger = BudgetLedger(policy)
+        with ledger.for_role("worker:audit-authz", role):
+            ledger.check_llm()
+            ledger.llm_rounds += 1
+            snapshot = ledger.snapshot()
+
+        restored = BudgetLedger.restore(policy, snapshot)
+        with restored.for_role("worker:audit-authz", role), self.assertRaises(RoleBudgetExceeded):
+            restored.check_llm()
+        with restored.for_role("worker:audit-sql", policy):
+            restored.check_llm()
+            restored.llm_rounds += 2
+            with self.assertRaises(BudgetExceeded) as error:
+                restored.check_llm()
+            self.assertNotIsInstance(error.exception, RoleBudgetExceeded)
+
+    async def _create_lineup(self):
+        async with self.factory() as db:
+            db.add_all([
+                AgentDefinition(slug="audit-planner", name="Planner", role="planner",
+                                model_override="planner-model", system_prompt="planner-instruction"),
+                AgentDefinition(slug="audit-authz", name="Auth", role="worker", specialties=["authz"],
+                                model_override="auth-model", system_prompt="auth-instruction"),
+                AgentDefinition(slug="audit-sql", name="SQL", role="worker", specialties=["injection"],
+                                model_override="sql-model", system_prompt="sql-instruction"),
+                AgentDefinition(slug="audit-review", name="Review", role="reviewer"),
+            ])
+            await db.commit()
+        return {
+            "planner_slug": "audit-planner", "worker_slugs": ["audit-authz", "audit-sql"],
+            "focus": ["authz", "injection"], "max_tasks": 2,
+        }
+
+    async def test_model_plan_changes_tasks_and_specialized_workers_run_serially(self):
+        lineup = await self._create_lineup()
+        path = f"/api/scans/{self.scan_ids['vuln']}/deep-audit/plan"
+        baseline = (await self.client.post(path, json={"focus": lineup["focus"]})).json()
+        calls = []
+        usage = {"prompt_tokens": 120, "completion_tokens": 30}
+        planner_calls = 0
+
+        async def planner(messages, **kwargs):
+            nonlocal planner_calls
+            planner_calls += 1
+            if planner_calls == 2:  # The run has already frozen its configuration.
+                async with self.factory() as db:
+                    row = await db.scalar(select(AgentDefinition).where(AgentDefinition.slug == "audit-sql"))
+                    row.enabled = False
+                    row.model_override = "changed-after-start"
+                    row.system_prompt = "changed-after-start"
+                    await db.commit()
+            self.assertEqual(kwargs["model"], "planner-model")
+            self.assertIn("planner-instruction", str(messages))
+            self.assertNotIn(str(self.root), str(messages))
+            return json.dumps({"tasks": [
+                {"focus": "authz", "target": "app.py", "goal": "Model checks owner", "priority": 80},
+                {"focus": "injection", "target": "services.py", "goal": "Model checks SQL", "priority": 70},
+            ]}), usage
+
+        async def worker(messages, **kwargs):
+            model = kwargs["model"]
+            calls.append(model)
+            instruction = {"auth-model": "auth-instruction", "sql-model": "sql-instruction"}[model]
+            self.assertIn(instruction, str(messages))
+            self.assertIn("Model checks", messages[0]["content"])
+            if calls.count(model) == 1:
+                file_path = "app.py" if model == "auth-model" else "services.py"
+                return json.dumps({"action": "tool", "tool": "read_file", "arguments": {
+                    "path": file_path, "start_line": 1, "end_line": 4,
+                }}), usage
+            return '{"action":"finish","findings":[]}', usage
+
+        with patch.object(settings, "llm_api_key", "test-key"), patch.object(
+            deep_audit_model_planner, "chat_completion_with_usage", side_effect=planner,
+        ), patch.object(deep_audit_worker, "chat_completion_with_usage", side_effect=worker):
+            preview_response = await self.client.post(path, json=lineup)
+            self.assertEqual(preview_response.status_code, 200, preview_response.text)
+            preview = preview_response.json()
+            self.assertEqual(preview["planner_result"]["mode"], "agent_llm")
+            self.assertNotEqual([t["goal"] for t in baseline["tasks"]], [t["goal"] for t in preview["tasks"]])
+            self.assertEqual([t["agent_id"] for t in preview["tasks"]], ["audit-authz", "audit-sql"])
+            run_id, run = await self._start("vuln", agent_slug=None, **lineup)
+
+        self.assertEqual(run["run"]["status"], "completed", run["run"])
+        self.assertEqual([t["agent_id"] for t in run["tasks"]], ["audit-authz", "audit-sql"])
+        self.assertEqual(calls, ["auth-model", "auth-model", "sql-model", "sql-model"])
+        self.assertEqual(planner_calls, 2)
+        self.assertEqual(run["budget_usage"]["llm_rounds"], 5)
+        self.assertEqual(run["budget_usage"]["role_usage"]["planner:audit-planner"]["llm_rounds"], 1)
+        self.assertEqual(run["budget_usage"]["role_usage"]["worker:audit-authz"]["tool_calls"], 1)
+        self.assertEqual(run["budget_usage"]["role_usage"]["worker:audit-sql"]["tool_calls"], 1)
+        self.assertNotIn("planner-instruction", json.dumps(run))
+        self.assertEqual(
+            {e["file_path"] for fact in run["shared_facts"] for e in fact["evidence"]},
+            {"app.py", "services.py"},
+        )
+        listed = (await self.client.get(f"/api/scans/{self.scan_ids['vuln']}/deep-audit/runs")).json()
+        self.assertEqual(listed["runs"][0]["id"], run_id)
+        self.assertNotIn("auth-instruction", json.dumps(listed))
+
+    async def test_reject_invalid_roles_and_out_of_scope_model_tasks(self):
+        lineup = await self._create_lineup()
+        path = f"/api/scans/{self.scan_ids['safe']}/deep-audit"
+        for changes in (
+            {"planner_slug": "audit-authz"}, {"worker_slugs": ["audit-planner"]},
+            {"worker_slugs": ["audit-review"]}, {"worker_slugs": ["audit-authz", "audit-authz"]},
+            {"agent_slug": "acceptance-worker"},
+        ):
+            self.assertEqual((await self.client.post(path + "/runs", json={**lineup, **changes})).status_code, 400)
+        proposal = {"tasks": [{"focus": "authz", "target": "services.py", "goal": "OUT OF SCOPE", "priority": 9}]}
+        with patch.object(settings, "llm_api_key", "test-key"), patch.object(
+            deep_audit_model_planner, "chat_completion_with_usage",
+            new=AsyncMock(return_value=(json.dumps(proposal), {"prompt_tokens": 100})),
+        ):
+            scope = {**lineup, "focus": ["authz"], "path_prefixes": ["app.py"]}
+            response = await self.client.post(path + "/plan", json=scope)
+            with patch.object(deep_audit_worker, "chat_completion_with_usage", new=AsyncMock(
+                return_value=('{"action":"finish","findings":[]}', {"prompt_tokens": 100}),
+            )):
+                _, rejected = await self._start("vuln", agent_slug=None, **scope)
+            self.assertEqual(rejected["run"]["config_snapshot"]["planner_result"]["fallback_reason"], "plan_out_of_scope")
+            self.assertNotIn("OUT OF SCOPE", json.dumps(rejected["tasks"]))
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["planner_result"]["fallback_reason"], "plan_out_of_scope")
+        self.assertNotIn("OUT OF SCOPE", response.text)
+        _, run = await self._start("safe", agent_slug=None, **lineup)
+        self.assertEqual(run["run"]["status"], "completed")
+        self.assertEqual(run["run"]["config_snapshot"]["planner_result"]["fallback_reason"], "llm_not_configured")
+        self.assertEqual(run["budget_usage"]["llm_rounds"], 0)
+        self.assertGreater(run["budget_usage"]["tool_calls"], 0)
 
     async def test_saved_budget_applies_to_new_runs_and_keeps_existing_snapshot(self):
         path = "/api/deep-audit/settings"

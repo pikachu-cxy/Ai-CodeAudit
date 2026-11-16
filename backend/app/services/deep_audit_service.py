@@ -1,4 +1,4 @@
-"""Deep Audit V1 scheduler: one Planner -> one general Worker -> blackboard.
+"""Deep Audit V1 scheduler: one Planner and up to three serial Workers.
 
 This is an ADDITIONAL, opt-in execution mode. It never replaces or calls the
 existing ``run_llm_audit_pipeline`` / ``run_scan_pipeline`` chains, and it does
@@ -11,7 +11,8 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from dataclasses import dataclass, field
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from sqlalchemy import select
@@ -20,15 +21,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import async_session
 from app.models import (
-    AuditRun, AuditRunStatus, AuditTask, AuditTaskStatus, AgentDefinition,
+    AgentDefinition, AuditRun, AuditRunStatus, AuditTask, AuditTaskStatus,
     Finding, ScanTask, ScanStatus,
 )
 from app.services import blackboard_service as bb
 from app.services.deep_audit_budget import (
-    BudgetExceeded, BudgetLedger, BudgetPolicy,
+    BudgetExceeded, BudgetLedger, BudgetPolicy, RoleBudgetExceeded,
 )
 from app.services.deep_audit_guards import ReadOnlyRepository, ToolPolicyError, relative_path
-from app.services.deep_audit_planner import AuditScope, PlannerInput, plan_tasks
+from app.services.deep_audit_lineup import RoleConfig, assign_workers, builtin_worker, freeze_role, resolve_lineup
+from app.services.deep_audit_model_planner import generate_plan
+from app.services.deep_audit_planner import AuditScope, PlannerInput
 from app.services.deep_audit_worker import log_event, run_worker_task
 from app.services.endpoint_discovery_service import list_endpoints_summary
 from app.services.llm_provider import is_llm_configured
@@ -51,6 +54,8 @@ class DeepAuditStartOptions:
     focus: list[str] = field(default_factory=list)
     path_prefixes: list[str] = field(default_factory=list)
     max_tasks: int | None = None
+    planner_slug: str | None = None
+    worker_slugs: list[str] | None = None
 
 
 def request_cancel(run_id: int) -> None:
@@ -79,16 +84,6 @@ def _loads(value: str | None, fallback: Any) -> Any:
         return fallback
 
 
-async def _resolve_agent(db: AsyncSession, slug: str | None) -> AgentDefinition | None:
-    stmt = select(AgentDefinition).where(AgentDefinition.enabled.is_(True))
-    if slug:
-        stmt = stmt.where(AgentDefinition.slug == slug.strip())
-    else:
-        return None
-    stmt = stmt.order_by(AgentDefinition.id.asc()).limit(1)
-    return (await db.execute(stmt)).scalars().first()
-
-
 def _project_root(scan: ScanTask) -> Path:
     root = Path(scan.project_path).resolve()
     managed_roots = (settings.repos_dir.resolve(), settings.uploads_dir.resolve())
@@ -112,6 +107,10 @@ async def _repository(scan: ScanTask, scope: AuditScope, ledger: BudgetLedger, c
         ),
         timeout=ledger.remaining_seconds(),
     )
+
+
+def _relative_files(repo: ReadOnlyRepository) -> tuple[str, ...]:
+    return tuple(path.relative_to(repo.root).as_posix() for path in repo.files)
 
 
 async def _endpoints(repo: ReadOnlyRepository, ledger: BudgetLedger, check=None) -> list[dict]:
@@ -149,7 +148,7 @@ async def _sast_context(db: AsyncSession, scan_id: int) -> list[dict]:
 
 
 async def _previous_context(db: AsyncSession, scan_id: int, current_run_id: int, revision: str) -> tuple[list[dict], set[str]]:
-    from app.models import AuditFact, AuditTaskStatus
+    from app.models import AuditFact
 
     fact_rows = (
         await db.execute(
@@ -184,11 +183,12 @@ async def start_deep_audit(db: AsyncSession, options: DeepAuditStartOptions) -> 
     scan = await db.get(ScanTask, options.scan_id)
     if scan is None:
         raise ValueError(f"扫描不存在: {options.scan_id}")
-    agent = await _resolve_agent(db, options.agent_slug)
-    if options.agent_slug and agent is None:
-        raise ValueError(f"AgentDefinition 不存在或未启用: {options.agent_slug}")
-
-    policy = (await BudgetPolicy.for_new_run(db)).constrained_by(agent)
+    planner_row, worker_rows = await resolve_lineup(db, options.planner_slug, options.worker_slugs, options.agent_slug)
+    policy = await BudgetPolicy.for_new_run(db)
+    if options.agent_slug:
+        policy = policy.constrained_by(worker_rows[0])
+    planner = freeze_role(planner_row, policy) if planner_row else None
+    workers = [freeze_role(row, policy) for row in worker_rows] or [builtin_worker(policy)]
     use_llm = is_llm_configured()
     scope = AuditScope(
         focus=tuple(options.focus),
@@ -202,12 +202,14 @@ async def start_deep_audit(db: AsyncSession, options: DeepAuditStartOptions) -> 
         raise ToolPolicyError("建立只读源码清单超时") from exc
     config_snapshot = {
         "mode": "deep_audit_v1",
-        "planner": "deterministic_v1",
-        "worker_count": 1,
+        "planner": "agent_llm" if planner else "deterministic_v1",
+        "worker_count": len(workers),
+        "parallel_workers": False,
+        "lineup": {"planner": asdict(planner) if planner else None, "workers": [asdict(worker) for worker in workers]},
         "worker_mode": "llm" if use_llm else "deterministic_fallback",
         "llm_configured": use_llm,
-        "agent_definition_id": agent.id if agent else None,
-        "agent_role": agent.role if agent else "built-in",
+        "agent_definition_id": worker_rows[0].id if worker_rows else None,
+        "agent_role": "worker" if worker_rows else "built-in",
         "policy": policy.to_dict(),
         "mcp_tools_granted": False,
         "skills_granted": False,
@@ -222,8 +224,8 @@ async def start_deep_audit(db: AsyncSession, options: DeepAuditStartOptions) -> 
             db, options.scan_id,
             config_snapshot=config_snapshot,
             scope=scope.to_dict(),
-            agent_slug=agent.slug if agent else "deep-audit-worker",
-            agent_definition_id=agent.id if agent else None,
+            agent_slug=workers[0].slug,
+            agent_definition_id=worker_rows[0].id if worker_rows else None,
             revision=repo.revision,
         )
         await bb.update_run(db, run, budget_usage=ledger.snapshot())
@@ -276,14 +278,21 @@ async def _execute_run_inner(run_id: int, *, use_llm: bool = False, repo: ReadOn
                 error_message="扫描记录已不存在", finished=True,
             )
             return
-        agent = (
-            await db.get(AgentDefinition, run.agent_definition_id)
-            if run.agent_definition_id else None
-        )
-        if run.agent_definition_id and (agent is None or not agent.enabled):
-            raise ToolPolicyError("选定的 AgentDefinition 已停用或删除")
+        config = _loads(run.config_snapshot, {})
+        lineup = config.get("lineup")
+        legacy_agent = None
+        planner = None
+        workers = {}
+        if lineup is not None:
+            if lineup["planner"]:
+                planner = RoleConfig(**lineup["planner"])
+            workers = {role["slug"]: RoleConfig(**role) for role in lineup["workers"]}
+        elif run.agent_definition_id:
+            legacy_agent = await db.get(AgentDefinition, run.agent_definition_id)
+            if legacy_agent is None or not legacy_agent.enabled:
+                raise ToolPolicyError("选定的 AgentDefinition 已停用或删除")
         try:
-            policy = BudgetPolicy(**(_loads(run.config_snapshot, {}).get("policy") or BudgetPolicy.from_settings().to_dict()))
+            policy = BudgetPolicy(**(config.get("policy") or BudgetPolicy.from_settings().to_dict()))
         except (ToolPolicyError, TypeError, ValueError) as exc:
             await bb.update_run(
                 db, run, status=AuditRunStatus.FAILED.value,
@@ -308,7 +317,8 @@ async def _execute_run_inner(run_id: int, *, use_llm: bool = False, repo: ReadOn
         await log_event(
             db, run.scan_id, "run_started",
             {"run_id": run_id, "revision": run.repository_revision,
-             "agent": run.agent_slug, "mode": "llm" if use_llm else "deterministic"},
+             "agent": planner.slug if planner else "deterministic_v1",
+             "mode": "llm" if use_llm else "deterministic"},
         )
 
         tasks = await bb.list_tasks(db, run_id)
@@ -334,18 +344,27 @@ async def _execute_run_inner(run_id: int, *, use_llm: bool = False, repo: ReadOn
                 scope=scope,
                 revision=run.repository_revision,
             )
-            specs = plan_tasks(planner_input, hard_max_tasks=policy.max_tasks)
+            async def persist_planner_usage() -> None:
+                await bb.update_run(db, run, budget_usage=ledger.snapshot())
+
+            specs, planning = await generate_plan(
+                planner_input, _relative_files(repo), ledger, planner, use_llm, check, persist_planner_usage,
+            )
+            check()
+            specs = assign_workers(specs, list(workers.values()), run.agent_slug)
+            tasks = await bb.upsert_tasks(db, run, specs, config_snapshot={**config, "planner_result": planning})
             await log_event(
                 db, run.scan_id, "planner_finished",
-                {"run_id": run_id, "task_count": len(specs),
-                 "focus": scope_dict.get("focus"), "revision": run.repository_revision},
+                {"run_id": run_id, "task_count": len(specs), **planning,
+                 "agent": planner.slug if planner else "deterministic_v1",
+                 "model": planner.model_override if planner and use_llm else None},
             )
-            tasks = await bb.upsert_tasks(db, run_id, specs, run.agent_slug)
         await bb.update_run(db, run, status=AuditRunStatus.RUNNING.value)
 
         exhausted: str | None = None
         cancelled = False
         failure: str | None = None
+        role_failures: set[str] = set()
         for task in tasks:
             if task.status in (AuditTaskStatus.SKIPPED.value, AuditTaskStatus.COMPLETED.value):
                 continue
@@ -358,17 +377,26 @@ async def _execute_run_inner(run_id: int, *, use_llm: bool = False, repo: ReadOn
                 break
             await bb.update_task(db, task, status=AuditTaskStatus.RUNNING.value)
             try:
-                outcome = await run_worker_task(
-                    db, run=run, task=task, repo=repo, policy=policy,
-                    ledger=ledger, agent=agent,
-                    cancel_check=lambda: check_cancel(run_id),
-                    use_llm=use_llm,
-                )
+                worker = workers.get(task.agent_id)
+                worker_policy = BudgetPolicy(**worker.policy) if worker else policy
+                role_budget = ledger.for_role(f"worker:{worker.slug}", worker_policy) if worker else nullcontext()
+                with role_budget:
+                    outcome = await run_worker_task(
+                        db, run=run, task=task, repo=repo, policy=worker_policy,
+                        ledger=ledger, agent=worker or legacy_agent,
+                        cancel_check=check, use_llm=use_llm,
+                    )
                 await bb.update_task(
                     db, task,
                     status=AuditTaskStatus.COMPLETED.value,
                     result_summary=outcome.summary(),
                     budget_usage=ledger.snapshot(),
+                )
+            except RoleBudgetExceeded as exc:
+                role_failures.add(task.agent_id)
+                await bb.update_task(
+                    db, task, status=AuditTaskStatus.FAILED.value,
+                    result_summary=f"Worker 预算耗尽（{exc.dimension}），已完成事实已保存",
                 )
             except BudgetExceeded as exc:
                 exhausted = exc.dimension
@@ -403,6 +431,9 @@ async def _execute_run_inner(run_id: int, *, use_llm: bool = False, repo: ReadOn
         elif failure:
             final_status = AuditRunStatus.FAILED.value
             message = failure
+        elif role_failures:
+            final_status = AuditRunStatus.FAILED.value
+            message = f"Worker 角色预算耗尽：{'、'.join(sorted(role_failures))}"
         else:
             final_status = AuditRunStatus.COMPLETED.value
             message = None
@@ -451,12 +482,21 @@ async def resume_run(run_id: int, *, use_llm: bool | None = None) -> AuditRun | 
     return run
 
 
-async def plan_preview(db: AsyncSession, scan_id: int, scope: AuditScope) -> dict:
+async def plan_preview(
+    db: AsyncSession, scan_id: int, scope: AuditScope, *,
+    planner_slug: str | None = None, worker_slugs: list[str] | None = None,
+    agent_slug: str | None = None,
+) -> dict:
     """Planner-only dry run (no execution, no writes) for the UI."""
     scan = await db.get(ScanTask, scan_id)
     if scan is None:
         raise ValueError(f"扫描不存在: {scan_id}")
+    planner_row, worker_rows = await resolve_lineup(db, planner_slug, worker_slugs, agent_slug)
     policy = await BudgetPolicy.for_new_run(db)
+    if agent_slug:
+        policy = policy.constrained_by(worker_rows[0])
+    planner = freeze_role(planner_row, policy) if planner_row else None
+    workers = [freeze_role(row, policy) for row in worker_rows] or [builtin_worker(policy)]
     sast_findings = await _sast_context(db, scan_id)
     preview_scope = scope.normalised(policy.max_tasks)
     ledger = BudgetLedger(policy)
@@ -475,9 +515,13 @@ async def plan_preview(db: AsyncSession, scan_id: int, scope: AuditScope) -> dic
         scope=preview_scope,
         revision=repo.revision,
     )
+    specs, planning = await generate_plan(
+        data, _relative_files(repo), ledger, planner, is_llm_configured(), ledger.check_time,
+    )
     return {
         "scan_id": scan_id,
         "revision": repo.revision,
         "scope": preview_scope.to_dict(),
-        "tasks": plan_tasks(data, hard_max_tasks=policy.max_tasks),
+        "tasks": assign_workers(specs, workers, workers[0].slug),
+        "planner_result": planning,
     }

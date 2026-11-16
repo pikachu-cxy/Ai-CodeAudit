@@ -146,6 +146,11 @@ async def _run_python_hook(version: str, conn: AsyncConnection) -> None:
 
         await apply_008_findings_scan_indexes(conn)
 
+    if version == "011":
+        from app.migrations.hooks import apply_011_agent_specialties
+
+        await apply_011_agent_specialties(conn)
+
 
 async def run_pending_migrations(conn: AsyncConnection, *, backend: str | None = None) -> list[str]:
     """Apply pending SQL migrations in order. Returns applied version ids."""

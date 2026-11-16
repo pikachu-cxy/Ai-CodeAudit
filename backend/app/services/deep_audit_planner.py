@@ -77,7 +77,7 @@ class AuditScope:
         if not focus:
             focus = list(FOCUS_KEYS)
         prefixes = tuple(
-            str(p).strip().replace("\\", "/").lstrip("/")[:200]
+            str(p).strip().replace("\\", "/").lstrip("/")
             for p in self.path_prefixes if str(p).strip()
         )
         return AuditScope(tuple(focus), prefixes, max(1, min(int(self.max_tasks or 0) or hard_max, hard_max)))

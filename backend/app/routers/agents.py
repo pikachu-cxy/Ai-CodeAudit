@@ -1,10 +1,4 @@
-"""Agent definition registry + Deep Audit V1 runtime wiring.
-
-Enabled definitions can now be selected for the opt-in Deep Audit V1 mode:
-they tune the single Worker model / prompt / budget. They still do NOT create
-extra Agents, and MCP / Skill execution permission is never granted.
-The legacy scan and LLM audit pipelines are untouched.
-"""
+"""Agent definition registry for Deep Audit role configuration."""
 from __future__ import annotations
 
 import re
@@ -20,6 +14,7 @@ from app.dependencies.auth import require_admin
 from app.models import AgentDefinition, dt_iso
 from app.services.llm_provider import is_llm_configured, resolve_model
 from app.services.deep_audit_guards import ALLOWED_TOOLS
+from app.services.deep_audit_planner import FOCUS_KEYS
 from app.services.platform_service import log_action
 
 router = APIRouter(
@@ -47,6 +42,7 @@ class AgentIn(BaseModel):
     model_task: str = "agent"
     model_override: str = ""
     system_prompt: str = ""
+    specialties: list[str] = Field(default_factory=list, max_length=3)
     max_tool_rounds: int = 10
     max_files: int = 16
     max_tokens: int = 8192
@@ -60,6 +56,7 @@ class AgentUpdate(BaseModel):
     model_task: str | None = None
     model_override: str | None = None
     system_prompt: str | None = None
+    specialties: list[str] | None = Field(default=None, max_length=3)
     max_tool_rounds: int | None = None
     max_files: int | None = None
     max_tokens: int | None = None
@@ -75,6 +72,7 @@ class AgentOut(BaseModel):
     model_task: str
     model_override: str
     system_prompt: str
+    specialties: list[str]
     max_tool_rounds: int
     max_files: int
     max_tokens: int
@@ -114,6 +112,10 @@ def _validate_fields(data: dict) -> None:
         bad("模型名称不能超过 128 个字符")
     if "enabled" in data and not isinstance(data["enabled"], bool):
         bad("enabled 必须是布尔值")
+    if "specialties" in data:
+        values = data["specialties"]
+        if values is None or len(set(values)) != len(values) or any(key not in FOCUS_KEYS for key in values):
+            bad("擅长方向须为不重复的 authz、injection 或 business_logic")
     for key, (low, high) in BUDGET_RANGES.items():
         if key in data:
             try:
@@ -137,11 +139,12 @@ def _to_out(row: AgentDefinition) -> AgentOut:
         model_task=row.model_task,
         model_override=row.model_override or "",
         system_prompt=row.system_prompt or "",
+        specialties=row.specialties or [],
         max_tool_rounds=row.max_tool_rounds,
         max_files=row.max_files,
         max_tokens=row.max_tokens,
         effective_model=resolve_model(task, explicit=row.model_override or None),
-        execution_wired=bool(row.enabled),
+        execution_wired=bool(row.enabled and row.role in ("planner", "worker")),
         created_at=dt_iso(row.created_at),
         updated_at=dt_iso(row.updated_at),
     )
@@ -159,9 +162,9 @@ async def capabilities() -> dict:
     """Real runtime facts — never a fabricated model catalogue."""
     llm_on = is_llm_configured()
     return {
-        "runtime_status": "deep_audit_v1_single_worker",
+        "runtime_status": "deep_audit_v1_serial_roles",
         "execution_wired": True,
-        "scheduler": "PlannerV1 -> 1 Worker (deep_audit_service)",
+        "scheduler": "1 Planner → 1–3 Workers（串行）",
         "blackboard": "audit_runs / audit_tasks / audit_facts / audit_evidence",
         "llm_configured": llm_on,
         "roles": list(AGENT_ROLES),
@@ -177,6 +180,8 @@ async def capabilities() -> dict:
         "deep_audit": {
             "mode": "deep_audit_v1",
             "worker_count": 1,
+            "max_workers": 3,
+            "parallel_workers": False,
             "worker_mode": "llm" if llm_on else "deterministic_fallback",
             "allowed_tools": sorted(ALLOWED_TOOLS),
             "mcp_tools_granted": False,
@@ -186,9 +191,8 @@ async def capabilities() -> dict:
             "legacy_llm_audit_preserved": True,
         },
         "note": (
-            "Deep Audit V1 已作为可选执行模式接入：启用状态的 AgentDefinition 可被选中，"
-            "用于调整那 1 个通用 Worker 的模型、附加提示词和预算上限（只能收紧，不能放宽硬上限）。"
-            "角色字段仍是配置标签，不会增加 Agent 数量；MCP / Skill 未授予任何执行权限。"
+            "Deep Audit V1 可选择已启用的 Planner 和 1–3 个 Worker，按擅长方向串行分配任务。"
+            "MCP / Skill 未授予执行权限。"
             "候选 Finding 必须带代码证据且保持 UNREVIEWED/PENDING，只有人工复核才能确认。"
             "effective_model 来自现有 LLM 设置解析，此端点不做任何模型调用。"
         ),

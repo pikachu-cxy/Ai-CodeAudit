@@ -26,6 +26,7 @@ from app.models import (
     AuditRunStatus, AuditTask, AuditTaskStatus, Finding, FindingCategory,
     ReviewStatus, ScanTask, Severity, dt_iso, utcnow,
 )
+from app.services.deep_audit_lineup import public_config
 from app.services.tool_log_redaction import redact_text
 
 logger = logging.getLogger(__name__)
@@ -194,11 +195,14 @@ async def resume_run(db: AsyncSession, run_id: int) -> AuditRun | None:
 
 async def upsert_tasks(
     db: AsyncSession,
-    run_id: int,
+    run: AuditRun,
     specs: list[dict],
-    agent_id: str,
+    *,
+    config_snapshot: dict,
 ) -> list[AuditTask]:
-    """Insert Planner tasks, skipping fingerprints already present in this run."""
+    """Commit the validated plan and its planning result in one transaction."""
+    run_id = run.id
+    run.config_snapshot = _dumps(config_snapshot)
     existing = {
         row.fingerprint: row
         for row in (
@@ -215,13 +219,14 @@ async def upsert_tasks(
             continue
         row = AuditTask(
             run_id=run_id,
-            agent_id=str(agent_id or "")[:64],
+            agent_id=spec["agent_id"],
             task_type=str(spec.get("task_type") or "business_logic")[:32],
-            goal=str(spec.get("goal") or "")[:MAX_SUMMARY_CHARS],
+            goal=redact_text(str(spec.get("goal") or ""))[:MAX_SUMMARY_CHARS],
             status=str(spec.get("status") or AuditTaskStatus.PENDING.value),
             priority=int(spec.get("priority") or 0),
             fingerprint=fp,
             scope_json=_dumps(spec.get("scope") or {}),
+            result_summary=str(spec.get("result_summary") or ""),
         )
         db.add(row)
         await db.flush()
@@ -660,6 +665,11 @@ async def run_summary(db: AsyncSession, run_id: int) -> dict | None:
             for row in rows
         ]
     budget = _loads(run.budget_usage, {})
+    config = public_config(_loads(run.config_snapshot, {}))
+    planner = (config.get("lineup") or {}).get("planner")
+    current_agent = running.agent_id if running else run.agent_slug or "deep-audit-worker"
+    if run.status == AuditRunStatus.PLANNING.value:
+        current_agent = planner["slug"] if planner else "deterministic_v1"
     return {
         "run": {
             "id": run.id, "scan_id": run.scan_id, "status": run.status,
@@ -669,9 +679,9 @@ async def run_summary(db: AsyncSession, run_id: int) -> dict | None:
             "finished_at": dt_iso(run.finished_at),
             "error_message": run.error_message,
             "scope": _loads(run.scope_json, {}),
-            "config_snapshot": _loads(run.config_snapshot, {}),
+            "config_snapshot": config,
         },
-        "current_agent": run.agent_slug or "deep-audit-worker",
+        "current_agent": current_agent,
         "current_task": (
             {"id": running.id, "task_type": running.task_type, "goal": running.goal,
              "status": running.status, "priority": running.priority}

@@ -16,7 +16,9 @@ import {
   type DeepAuditEvent,
   type DeepAuditFact,
   type DeepAuditFocus,
+  type DeepAuditLineup,
   type DeepAuditPlan,
+  type DeepAuditPlannerResult,
   type DeepAuditRun,
   type DeepAuditSummary,
 } from "../api";
@@ -104,9 +106,27 @@ function payloadPreview(payload: unknown): string {
  * Shared launcher: used by the scan detail panel and the Agents page.
  * ------------------------------------------------------------------ */
 
+const PLANNER_FALLBACK: Record<string, string> = {
+  llm_not_configured: "LLM 未配置",
+  invalid_plan_schema: "模型计划格式无效",
+  plan_out_of_scope: "模型计划超出审计范围",
+  task_limit_exceeded: "模型计划超过任务数上限",
+  planner_prompt_exceeds_budget: "规划上下文超出预算",
+  planner_budget_exhausted: "Planner 角色预算耗尽",
+  planner_timeout: "模型调用超时",
+  planner_provider_error: "模型调用失败",
+};
+
+function plannerLabel(result: DeepAuditPlannerResult | undefined) {
+  if (!result) return "—";
+  if (result.mode === "agent_llm") return "Agent 模型规划";
+  const reason = result.fallback_reason;
+  return reason ? `内置规则（${PLANNER_FALLBACK[reason] ?? reason}）` : "内置规则";
+}
+
 export interface DeepAuditLauncherProps {
   scanId: number;
-  agentSlug?: string;
+  lineup?: DeepAuditLineup;
   focus?: DeepAuditFocus[];
   onFocusChange?: (focus: DeepAuditFocus[]) => void;
   onStarted?: (runId: number) => void;
@@ -114,7 +134,7 @@ export interface DeepAuditLauncherProps {
 
 export function DeepAuditLauncher({
   scanId,
-  agentSlug,
+  lineup,
   focus,
   onFocusChange,
   onStarted,
@@ -127,17 +147,20 @@ export function DeepAuditLauncher({
   ]);
   const [prefixText, setPrefixText] = useState("");
   const [maxTasks, setMaxTasks] = useState(6);
-  const [plan, setPlan] = useState<DeepAuditPlan | null>(null);
+  const [previewState, setPreviewState] = useState<{ key: string; data: DeepAuditPlan } | null>(null);
   const [busy, setBusy] = useState<"plan" | "start" | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
 
   const selected = focus ?? ownFocus;
   const changeFocus = onFocusChange ?? setOwnFocus;
-  const scope = () => ({
+  const scope = {
     focus: selected,
     path_prefixes: parsePrefixes(prefixText),
     max_tasks: maxTasks,
-  });
+    ...lineup,
+  };
+  const previewKey = JSON.stringify([scanId, scope]);
+  const plan = previewState?.key === previewKey ? previewState.data : null;
 
   const toggleFocus = (key: DeepAuditFocus) =>
     changeFocus(selected.includes(key) ? selected.filter((item) => item !== key) : [...selected, key]);
@@ -146,11 +169,11 @@ export function DeepAuditLauncher({
     setBusy("plan");
     setNotice(null);
     try {
-      const result = await api.deepAuditPlan(scanId, scope());
-      setPlan(result);
+      const result = await api.deepAuditPlan(scanId, scope);
+      setPreviewState({ key: previewKey, data: result });
       setNotice({
         tone: "info",
-        text: `Planner 生成 ${result.tasks.length} 条任务（纯数据预览：未写黑板、未启动 Worker、未调用 LLM）。`,
+        text: `Planner 生成 ${result.tasks.length} 条任务（预览未启动 Worker）。`,
       });
     } catch (err) {
       setNotice({ tone: "error", text: `规划预览失败：${errText(err)}` });
@@ -167,10 +190,7 @@ export function DeepAuditLauncher({
     setBusy("start");
     setNotice(null);
     try {
-      const result = await api.deepAuditStart(scanId, {
-        ...scope(),
-        agent_slug: agentSlug || null,
-      });
+      const result = await api.deepAuditStart(scanId, scope);
       setNotice({
         tone: "success",
         text: `Deep Audit 运行 #${result.run.id} 已启动（${result.run.status}）。Worker 仅能调用只读代码工具。`,
@@ -242,7 +262,7 @@ export function DeepAuditLauncher({
         </button>
         {caps.data && (
           <MonoMeta>
-            Worker ×{caps.data.worker_count} · {caps.data.worker_mode} · 只读工具 {caps.data.allowed_tools.length} 个
+            Worker ×{lineup?.worker_slugs?.length ?? 1}（串行） · {caps.data.worker_mode} · 只读工具 {caps.data.allowed_tools.length} 个
           </MonoMeta>
         )}
       </div>
@@ -264,7 +284,7 @@ export function DeepAuditLauncher({
       {plan && (
         <div className="space-y-1.5">
           <p className="text-xs text-[var(--text-secondary)]">
-            任务预览 · 代码版本 <MonoMeta>{plan.revision || "—"}</MonoMeta> ·{" "}
+            任务预览 · {plannerLabel(plan.planner_result)} · 代码版本 <MonoMeta>{plan.revision || "—"}</MonoMeta> ·{" "}
             <MonoMeta>{plan.tasks.length} 条</MonoMeta>
           </p>
           {plan.tasks.length === 0 ? (
@@ -280,6 +300,7 @@ export function DeepAuditLauncher({
                     <StatusPill tone={task.status === "skipped" ? "muted" : "accent"}>
                       {task.task_type}
                     </StatusPill>
+                    <MonoMeta>{task.agent_id}</MonoMeta>
                     <MonoMeta>P{task.priority}</MonoMeta>
                     <MonoMeta>{task.status}</MonoMeta>
                   </div>
@@ -477,6 +498,16 @@ export function DeepAuditPanel({
               </div>
 
               <div className="grid gap-x-8 md:grid-cols-2">
+                {data?.run.config_snapshot.lineup && (
+                  <>
+                    <KeyValueRow label="Planner">
+                      {data.run.config_snapshot.lineup.planner?.slug ?? "内置"} · {plannerLabel(data.run.config_snapshot.planner_result)}
+                    </KeyValueRow>
+                    <KeyValueRow label="Worker 阵容">
+                      {data.run.config_snapshot.lineup.workers.map((worker) => worker.slug).join("、")}
+                    </KeyValueRow>
+                  </>
+                )}
                 <KeyValueRow label="当前任务">
                   {data?.current_task ? (
                     <span className="text-xs">

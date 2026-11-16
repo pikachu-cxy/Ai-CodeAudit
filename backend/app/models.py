@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from sqlalchemy import (
-    Boolean, DateTime, Enum, Float, ForeignKey, Index, Integer, String,
+    Boolean, DateTime, Enum, Float, ForeignKey, Index, Integer, JSON, String,
     Text, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -320,7 +320,7 @@ class RefreshToken(Base):
 
 
 class AgentDefinition(Base):
-    """Agent configuration optionally selected for the Deep Audit worker."""
+    """Agent configuration for Deep Audit role selection."""
 
     __tablename__ = "agent_definitions"
 
@@ -334,6 +334,7 @@ class AgentDefinition(Base):
     model_task: Mapped[str] = mapped_column(String(32), default="agent")
     model_override: Mapped[str] = mapped_column(String(128), default="")
     system_prompt: Mapped[str] = mapped_column(Text, default="")
+    specialties: Mapped[list[str] | None] = mapped_column(JSON, default=list)
     max_tool_rounds: Mapped[int] = mapped_column(Integer, default=10)
     max_files: Mapped[int] = mapped_column(Integer, default=16)
     max_tokens: Mapped[int] = mapped_column(Integer, default=8192)

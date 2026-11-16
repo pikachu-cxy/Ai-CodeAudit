@@ -1099,6 +1099,7 @@ export interface AgentDefinition {
   model_task: string;
   model_override: string;
   system_prompt: string;
+  specialties: DeepAuditFocus[];
   max_tool_rounds: number;
   max_files: number;
   max_tokens: number;
@@ -1129,6 +1130,8 @@ export interface AgentCapabilities {
   deep_audit?: {
     mode: string;
     worker_count: number;
+    max_workers: number;
+    parallel_workers: boolean;
     worker_mode: string;
     allowed_tools: string[];
     mcp_tools_granted: boolean;
@@ -1149,6 +1152,27 @@ export interface DeepAuditScope {
   max_tasks?: number;
 }
 
+export interface DeepAuditLineup {
+  planner_slug?: string | null;
+  worker_slugs?: string[];
+}
+
+export interface DeepAuditPlannerResult {
+  mode: "agent_llm" | "deterministic_v1";
+  fallback_reason: string | null;
+}
+
+interface DeepAuditRoleSnapshot {
+  slug: string;
+  model_override: string;
+  specialties: DeepAuditFocus[];
+}
+
+interface DeepAuditRunConfig {
+  lineup?: { planner: DeepAuditRoleSnapshot | null; workers: DeepAuditRoleSnapshot[] };
+  planner_result?: DeepAuditPlannerResult;
+}
+
 export interface DeepAuditBudgetSettings {
   max_llm_rounds: number;
   max_tool_calls: number;
@@ -1161,6 +1185,8 @@ export interface DeepAuditCapabilities {
   runtime_status: string;
   planner: string;
   worker_count: number;
+  max_workers: number;
+  parallel_workers: boolean;
   blackboard: string[];
   allowed_tools: string[];
   mcp_tools_granted: boolean;
@@ -1174,6 +1200,7 @@ export interface DeepAuditCapabilities {
 }
 
 export interface DeepAuditPlanTask {
+  agent_id: string;
   task_type: string;
   goal: string;
   priority: number;
@@ -1192,6 +1219,7 @@ export interface DeepAuditPlan {
     labels: Record<string, string>;
   };
   tasks: DeepAuditPlanTask[];
+  planner_result: DeepAuditPlannerResult;
 }
 
 export interface DeepAuditBudgetUsage {
@@ -1215,7 +1243,7 @@ export interface DeepAuditRun {
   agent_slug: string;
   agent_definition_id: number | null;
   repository_revision: string;
-  config_snapshot: Record<string, unknown>;
+  config_snapshot: DeepAuditRunConfig;
   scope: {
     focus?: string[];
     path_prefixes?: string[];
@@ -1290,7 +1318,7 @@ export interface DeepAuditSummary {
     finished_at: string | null;
     error_message: string | null;
     scope: DeepAuditRun["scope"];
-    config_snapshot: Record<string, unknown>;
+    config_snapshot: DeepAuditRunConfig;
     is_active?: boolean;
   };
   scan_id: number;
@@ -2020,12 +2048,12 @@ export const api = {
       body: JSON.stringify(budget),
     }),
   deepAuditCapabilities: () => request<DeepAuditCapabilities>("/deep-audit/capabilities"),
-  deepAuditPlan: (scanId: number, scope: DeepAuditScope) =>
+  deepAuditPlan: (scanId: number, scope: DeepAuditScope & DeepAuditLineup) =>
     request<DeepAuditPlan>(`/scans/${scanId}/deep-audit/plan`, {
       method: "POST",
       body: JSON.stringify(scope),
     }),
-  deepAuditStart: (scanId: number, body: DeepAuditScope & { agent_slug?: string | null }) =>
+  deepAuditStart: (scanId: number, body: DeepAuditScope & DeepAuditLineup & { agent_slug?: string | null }) =>
     request<{ ok: boolean; run: DeepAuditRun }>(`/scans/${scanId}/deep-audit/runs`, {
       method: "POST",
       body: JSON.stringify(body),
