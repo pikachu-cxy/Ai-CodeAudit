@@ -1,17 +1,21 @@
 import asyncio
+import json
+import logging
+from collections.abc import Callable
+from contextlib import suppress
 import tempfile
 from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 import fnmatch
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import build_database_url, database_backend_name, normalize_mysql_charset, persist_runtime_settings, settings
-from app.database import get_db
+from app.database import async_session, get_db
 from app.dependencies.auth import require_admin, require_auth
 from app.exceptions import DuplicateGitUrlError, DuplicateProjectNameError, WebhookValidationError, duplicate_project_http_detail
 from app.models import AiVerdict, ExternalReviewStatus, Finding, FindingCategory, ReviewStatus, ScanEvent, ScanKind, ScanStatus, ScanTask, Severity, dt_iso
@@ -1181,7 +1185,7 @@ async def review_finding(
         )
     except ValueError as exc:
         msg = str(exc)
-        if "误报" in msg:
+        if "误报" in msg or "缺少对应代码证据" in msg:
             raise HTTPException(400, msg) from exc
         raise HTTPException(404, "Finding not found") from exc
     return FindingOut.model_validate(finding)
@@ -2366,9 +2370,57 @@ async def agent_chat_actions(scan_id: int, limit: int = 12, db: AsyncSession = D
 async def agent_chat(
     scan_id: int,
     body: AgentChatRequest,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
+    return await _run_agent_chat(scan_id, body, db)
+
+
+@router.post("/scans/{scan_id}/agent-chat/stream")
+async def agent_chat_stream(scan_id: int, body: AgentChatRequest, db: AsyncSession = Depends(get_db)):
+    if await db.get(ScanTask, scan_id) is None:
+        raise HTTPException(404, "Scan not found")
+
+    async def events():
+        queue = asyncio.Queue()
+
+        def emit(event: str, data):
+            queue.put_nowait((event, data))
+
+        async def run():
+            try:
+                async with async_session() as session:
+                    result = await _run_agent_chat(scan_id, body, session, emit=emit)
+                emit("done", result.model_dump(mode="json"))
+            except Exception:
+                logging.getLogger(__name__).exception("Agent chat failed for scan %s", scan_id)
+                emit("error", "对话请求失败，请稍后重试。")
+
+        work = asyncio.create_task(run())
+        try:
+            while True:
+                try:
+                    event, data = await asyncio.wait_for(queue.get(), timeout=15)
+                except TimeoutError:
+                    yield '{"event":"heartbeat"}\n'
+                    continue
+                yield json.dumps({"event": event, "data": data}, ensure_ascii=True) + "\n"
+                if event in {"done", "error"}:
+                    break
+        finally:
+            work.cancel()
+            with suppress(asyncio.CancelledError):
+                await work
+
+    return StreamingResponse(
+        events(), media_type="application/x-ndjson",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"},
+    )
+
+
+async def _run_agent_chat(
+    scan_id: int, body: AgentChatRequest, db: AsyncSession,
+    *, emit: Callable[[str, str], None] | None = None,
+) -> AgentChatResponse:
     scan = await db.get(ScanTask, scan_id)
     if not scan:
         raise HTTPException(404, "Scan not found")
@@ -2378,6 +2430,8 @@ async def agent_chat(
 
     action = _chat_action_intent(user_text)
     action_result: str | None = None
+    if action and emit:
+        emit("progress", "正在执行审计操作")
 
     if action == "fp_audit":
         result = await analyze_scan_findings(db, scan_id, None, 50, force=False)
@@ -2438,6 +2492,7 @@ async def agent_chat(
         user_text,
         max_history=body.max_history,
         action_result=action_result,
+        emit=emit,
     )
     await append_chat_event(db, scan_id, "assistant", reply)
     messages = await list_chat_messages(db, scan_id, limit=max(body.max_history, 20))

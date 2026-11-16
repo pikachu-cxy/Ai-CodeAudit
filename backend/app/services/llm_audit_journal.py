@@ -7,6 +7,7 @@ from typing import Any
 
 from app.database import async_session
 from app.models import ScanEvent
+from app.services.tool_log_redaction import redact_arguments, redact_text
 
 LLM_AUDIT_PHASE = "llm_audit"
 
@@ -23,6 +24,12 @@ async def log_llm_audit_journal(
         "type": event_type,
         **payload,
     }
+    if event_type in {"bootstrap_tool", "tool_round", "investigation_trace"}:
+        if "arguments" in body:
+            body["arguments"] = redact_arguments(body["arguments"], include_strings=False)
+        for key in ("files", "trace_files"):
+            if isinstance(body.get(key), list):
+                body[key] = [redact_text(str(path))[:300] for path in body[key][:12]]
     async with async_session() as session:
         session.add(
             ScanEvent(

@@ -87,7 +87,10 @@ def _resolve_path_in_project(project_path: Path, raw_path: str) -> Path | None:
     name = candidate.name
     if not name:
         return None
-    matches = [p for p in root.rglob(name) if p.is_file() and not should_skip_walk_path(p, SKIP_DIRS)]
+    matches = [
+        p for p in root.rglob(name)
+        if p.is_file() and not should_skip_walk_path(p, SKIP_DIRS, relative_to=root)
+    ]
     return matches[0] if matches else None
 
 
@@ -150,7 +153,7 @@ def _iter_source_files(
             continue
         if allowed_suffixes and suffix not in allowed_suffixes:
             continue
-        if should_skip_walk_path(path, SKIP_DIRS):
+        if should_skip_walk_path(path, SKIP_DIRS, relative_to=project_path):
             continue
         if prefer_file and path.resolve() == prefer_file.resolve():
             continue
@@ -174,7 +177,7 @@ def _iter_nearby_source_files(
             continue
         if allowed_suffixes and suffix not in allowed_suffixes:
             continue
-        if should_skip_walk_path(path, SKIP_DIRS):
+        if should_skip_walk_path(path, SKIP_DIRS, relative_to=parent):
             continue
         if path.resolve() == prefer_file.resolve():
             continue
@@ -190,13 +193,15 @@ def locate_text_in_project(
     max_files_scanned: int | None = None,
     cancel_check: Callable[[], None] | None = None,
     max_file_bytes: int | None = None,
+    source_files: tuple[Path, ...] | None = None,
+    read_source: Callable[[Path], str] | None = None,
 ) -> list[dict]:
     """Search project source for a symbol / snippet and return file+line hits."""
     query = (query or "").strip()
     if not query or len(query) < 2:
         return []
 
-    loc = parse_location_ref(query, project_path, file_hint)
+    loc = parse_location_ref(query, project_path, file_hint) if source_files is None else None
     if loc:
         return [loc]
 
@@ -248,9 +253,15 @@ def locate_text_in_project(
 
     for allowed_suffixes in passes:
         iterators = []
-        if prefer:
+        if source_files is not None:
+            iterators.append(
+                path for path in source_files
+                if not allowed_suffixes or path.suffix.lower() in allowed_suffixes
+            )
+        elif prefer:
             iterators.append(_iter_nearby_source_files(prefer, allowed_suffixes=allowed_suffixes))
-        iterators.append(_iter_source_files(project_path, prefer, allowed_suffixes=allowed_suffixes))
+        if source_files is None:
+            iterators.append(_iter_source_files(project_path, prefer, allowed_suffixes=allowed_suffixes))
         for iterator in iterators:
             for path in iterator:
                 scanned_files += 1
@@ -263,7 +274,8 @@ def locate_text_in_project(
                 try:
                     if max_file_bytes is not None and path.stat().st_size > max_file_bytes:
                         continue
-                    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    text = read_source(path) if read_source else path.read_text(encoding="utf-8", errors="replace")
+                    lines = text.splitlines()
                 except OSError:
                     continue
 

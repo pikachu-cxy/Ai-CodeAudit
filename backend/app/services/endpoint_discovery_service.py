@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 import time
 from collections.abc import Callable
@@ -202,9 +203,9 @@ def _java_class_name(text: str) -> str:
     return m.group(1) if m else ""
 
 
-def _discover_java_endpoints(project_path: Path, file_path: Path) -> ControllerUnit | None:
+def _discover_java_endpoints(project_path: Path, file_path: Path, *, read_source=None) -> ControllerUnit | None:
     try:
-        text = file_path.read_text(encoding="utf-8", errors="replace")
+        text = read_source(file_path) if read_source else file_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
 
@@ -276,9 +277,9 @@ def _extract_py_path(args: str) -> str:
     return quoted[0] if quoted else ""
 
 
-def _discover_python_endpoints(project_path: Path, file_path: Path) -> ControllerUnit | None:
+def _discover_python_endpoints(project_path: Path, file_path: Path, *, read_source=None) -> ControllerUnit | None:
     try:
-        text = file_path.read_text(encoding="utf-8", errors="replace")
+        text = read_source(file_path) if read_source else file_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
 
@@ -379,11 +380,11 @@ def _resolve_js_module_path(base_dir: Path, req_path: str) -> Path | None:
     return None
 
 
-def _collect_express_mount_prefixes(project_path: Path) -> dict[str, str]:
+def _collect_express_mount_prefixes(project_path: Path, *, source_files=None, read_source=None) -> dict[str, str]:
     """Map route module relative paths to mount prefixes from entry files."""
     root = project_path.resolve()
     cache_key = str(root)
-    cached = _cache_get(_EXPRESS_MOUNT_CACHE, cache_key)
+    cached = _cache_get(_EXPRESS_MOUNT_CACHE, cache_key) if source_files is None else None
     if cached is not None:
         return cached
 
@@ -399,11 +400,11 @@ def _collect_express_mount_prefixes(project_path: Path) -> dict[str, str]:
         for name in _ENTRY_FILE_NAMES:
             entry_path = entry_dir / name
             key = str(entry_path.resolve())
-            if key in seen_entries or not entry_path.is_file():
+            if key in seen_entries or not entry_path.is_file() or (source_files is not None and entry_path not in source_files):
                 continue
             seen_entries.add(key)
             try:
-                text = entry_path.read_text(encoding="utf-8", errors="replace")
+                text = read_source(entry_path) if read_source else entry_path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
 
@@ -433,7 +434,7 @@ def _collect_express_mount_prefixes(project_path: Path) -> dict[str, str]:
                     rel = _normalize_rel_posix(root, resolved)
                     mounts[rel] = prefix
 
-    return _cache_set(_EXPRESS_MOUNT_CACHE, cache_key, mounts)
+    return _cache_set(_EXPRESS_MOUNT_CACHE, cache_key, mounts) if source_files is None else mounts
 
 
 def _same_file_router_prefixes(text: str) -> dict[str, str]:
@@ -599,9 +600,10 @@ def _discover_js_ts_endpoints(
     file_path: Path,
     *,
     mount_prefixes: dict[str, str] | None = None,
+    read_source=None,
 ) -> ControllerUnit | None:
     try:
-        text = file_path.read_text(encoding="utf-8", errors="replace")
+        text = read_source(file_path) if read_source else file_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
 
@@ -630,25 +632,28 @@ def _discover_js_ts_endpoints(
 def discover_controller_units(
     project_path: Path,
     cancel_check: Callable[[], None] | None = None,
+    *,
+    source_files: tuple[Path, ...] | None = None,
+    read_source: Callable[[Path], str] | None = None,
 ) -> list[ControllerUnit]:
     """Scan project and return controller files grouped with their endpoints."""
     root = project_path.resolve()
     cache_key = str(root)
-    cached = _cache_get(_CONTROLLER_CACHE, cache_key)
+    cached = _cache_get(_CONTROLLER_CACHE, cache_key) if source_files is None else None
     if cached is not None:
         return cached
 
     units: list[ControllerUnit] = []
-    mount_prefixes = _collect_express_mount_prefixes(root)
+    mount_prefixes = _collect_express_mount_prefixes(root, source_files=source_files, read_source=read_source)
 
     checked = 0
-    for path in root.rglob("*"):
+    for path in source_files if source_files is not None else root.rglob("*"):
         if not path.is_file():
             continue
         checked += 1
         if cancel_check and checked % 200 == 0:
             cancel_check()
-        if should_skip_walk_path(path, SKIP_DIRS):
+        if should_skip_walk_path(path, SKIP_DIRS, relative_to=root):
             continue
         suffix = path.suffix.lower()
         if suffix not in CODE_EXTENSIONS:
@@ -656,17 +661,17 @@ def discover_controller_units(
 
         unit: ControllerUnit | None = None
         if suffix == ".java":
-            unit = _discover_java_endpoints(root, path)
+            unit = _discover_java_endpoints(root, path, read_source=read_source)
         elif suffix == ".py":
-            unit = _discover_python_endpoints(root, path)
+            unit = _discover_python_endpoints(root, path, read_source=read_source)
         elif suffix in JS_TS_SUFFIXES:
-            unit = _discover_js_ts_endpoints(root, path, mount_prefixes=mount_prefixes)
+            unit = _discover_js_ts_endpoints(root, path, mount_prefixes=mount_prefixes, read_source=read_source)
 
         if unit and unit.endpoints:
             units.append(unit)
 
     units.sort(key=lambda u: (-u.sensitivity, -len(u.endpoints), u.file))
-    return _cache_set(_CONTROLLER_CACHE, cache_key, units)
+    return _cache_set(_CONTROLLER_CACHE, cache_key, units) if source_files is None else units
 
 
 def list_endpoints_summary(
@@ -675,9 +680,11 @@ def list_endpoints_summary(
     filter_text: str = "",
     limit: int = 80,
     cancel_check: Callable[[], None] | None = None,
+    source_files: tuple[Path, ...] | None = None,
+    read_source: Callable[[Path], str] | None = None,
 ) -> list[dict]:
     """Flat endpoint list for Agent tools."""
-    units = discover_controller_units(project_path, cancel_check=cancel_check)
+    units = discover_controller_units(project_path, cancel_check=cancel_check, source_files=source_files, read_source=read_source)
     rows: list[dict] = []
     needle = (filter_text or "").strip().lower()
 
@@ -794,6 +801,8 @@ def find_related_service_files(
     cancel_check: Callable[[], None] | None = None,
     max_scan_seconds: float = 8.0,
     max_files_scanned: int = 1200,
+    source_files: tuple[Path, ...] | None = None,
+    read_source: Callable[[Path], str] | None = None,
 ) -> list[Path]:
     """Heuristically find Service/DAO files referenced by a controller.
 
@@ -802,12 +811,12 @@ def find_related_service_files(
     root = project_path.resolve()
     controller_resolved = controller_path.resolve()
     cache_key = f"{root}::{controller_resolved}"
-    cached = _cache_get(_RELATED_SERVICE_CACHE, cache_key)
+    cached = _cache_get(_RELATED_SERVICE_CACHE, cache_key) if source_files is None else None
     if cached is not None:
         return [Path(p) for p in cached[:max_files]]
 
     try:
-        text = controller_resolved.read_text(encoding="utf-8", errors="replace")
+        text = read_source(controller_resolved) if read_source else controller_resolved.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return []
 
@@ -832,6 +841,22 @@ def find_related_service_files(
         if base:
             symbols.add(base)
 
+    if source_files is not None and controller_resolved.suffix == ".py":
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            tree = None
+        if tree is not None:
+            imports = {
+                alias.asname or alias.name: alias.name
+                for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+                for alias in node.names
+            }
+            symbols.update(
+                imports[node.func.id] for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in imports
+            )
     if not symbols:
         return []
 
@@ -842,10 +867,13 @@ def find_related_service_files(
     # Prefer same package / nearby tree before full-repo walk.
     search_roots = [controller_resolved.parent]
     for up in list(controller_resolved.parents)[:4]:
-        if up == root or root in up.parents or up == root.parent:
+        if up == root or root in up.parents:
             search_roots.append(up)
     if root not in search_roots:
         search_roots.append(root)
+
+    if source_files is not None:
+        search_roots = [root]
 
     seen_paths: set[str] = set()
     for search_root in search_roots:
@@ -854,7 +882,7 @@ def find_related_service_files(
         if scanned >= max_files_scanned:
             break
         try:
-            iterator = search_root.rglob("*")
+            iterator = source_files if source_files is not None else search_root.rglob("*")
         except OSError:
             continue
         for path in iterator:
@@ -874,7 +902,7 @@ def find_related_service_files(
             seen_paths.add(key)
             if cancel_check and (scanned % 40 == 0):
                 cancel_check()
-            if should_skip_walk_path(path, SKIP_DIRS):
+            if should_skip_walk_path(path, SKIP_DIRS, relative_to=root):
                 continue
             if path.suffix.lower() not in {".java", ".py", ".kt", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
                 continue
@@ -882,7 +910,7 @@ def find_related_service_files(
             try:
                 if cancel_check and (scanned % 10 == 0):
                     cancel_check()
-                content = path.read_text(encoding="utf-8", errors="replace")
+                content = read_source(path) if read_source else path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
 
@@ -913,7 +941,8 @@ def find_related_service_files(
         out.append(p)
         if len(out) >= max_files:
             break
-    _cache_set(_RELATED_SERVICE_CACHE, cache_key, [str(p.resolve()) for p in out])
+    if source_files is None:
+        _cache_set(_RELATED_SERVICE_CACHE, cache_key, [str(p.resolve()) for p in out])
     return out[:max_files]
 
 
@@ -931,7 +960,7 @@ def find_cross_module_siblings(
     for path in root.rglob(name):
         if not path.is_file() or path.resolve() == controller_path.resolve():
             continue
-        if should_skip_walk_path(path, SKIP_DIRS):
+        if should_skip_walk_path(path, SKIP_DIRS, relative_to=root):
             continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")

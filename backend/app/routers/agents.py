@@ -1,8 +1,9 @@
-"""Agent definition registry — configuration only.
+"""Agent definition registry + Deep Audit V1 runtime wiring.
 
-IMPORTANT: no Planner/Worker scheduler, blackboard or executor consumes these
-rows. Saving an Agent here changes configuration data only; it does not create a
-runnable Agent and never touches the existing scan pipeline.
+Enabled definitions can now be selected for the opt-in Deep Audit V1 mode:
+they tune the single Worker model / prompt / budget. They still do NOT create
+extra Agents, and MCP / Skill execution permission is never granted.
+The legacy scan and LLM audit pipelines are untouched.
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ from app.database import get_db
 from app.dependencies.auth import require_admin
 from app.models import AgentDefinition, dt_iso
 from app.services.llm_provider import is_llm_configured, resolve_model
+from app.services.deep_audit_guards import ALLOWED_TOOLS
 from app.services.platform_service import log_action
 
 router = APIRouter(
@@ -139,7 +141,7 @@ def _to_out(row: AgentDefinition) -> AgentOut:
         max_files=row.max_files,
         max_tokens=row.max_tokens,
         effective_model=resolve_model(task, explicit=row.model_override or None),
-        execution_wired=False,
+        execution_wired=bool(row.enabled),
         created_at=dt_iso(row.created_at),
         updated_at=dt_iso(row.updated_at),
     )
@@ -155,12 +157,13 @@ async def _get_row(db: AsyncSession, agent_id: int) -> AgentDefinition:
 @router.get("/capabilities")
 async def capabilities() -> dict:
     """Real runtime facts — never a fabricated model catalogue."""
+    llm_on = is_llm_configured()
     return {
-        "runtime_status": "configuration_only",
-        "execution_wired": False,
-        "scheduler": None,
-        "blackboard": None,
-        "llm_configured": is_llm_configured(),
+        "runtime_status": "deep_audit_v1_single_worker",
+        "execution_wired": True,
+        "scheduler": "PlannerV1 -> 1 Worker (deep_audit_service)",
+        "blackboard": "audit_runs / audit_tasks / audit_facts / audit_evidence",
+        "llm_configured": llm_on,
         "roles": list(AGENT_ROLES),
         "model_tasks": list(MODEL_TASKS),
         "resolved_models": {
@@ -171,10 +174,23 @@ async def capabilities() -> dict:
         },
         "budget_ranges": {key: list(value) for key, value in BUDGET_RANGES.items()},
         "agent_tool_round_limit": settings.llm_agent_max_tool_rounds,
+        "deep_audit": {
+            "mode": "deep_audit_v1",
+            "worker_count": 1,
+            "worker_mode": "llm" if llm_on else "deterministic_fallback",
+            "allowed_tools": sorted(ALLOWED_TOOLS),
+            "mcp_tools_granted": False,
+            "skills_granted": False,
+            "finding_evidence_required": True,
+            "auto_confirm": False,
+            "legacy_llm_audit_preserved": True,
+        },
         "note": (
-            "这些记录只是配置定义：当前没有 Planner/Worker 调度器或代码事实黑板，"
-            "保存、启用都不会触发任何审计任务。effective_model 来自现有 LLM 设置解析，"
-            "不做任何模型调用。"
+            "Deep Audit V1 已作为可选执行模式接入：启用状态的 AgentDefinition 可被选中，"
+            "用于调整那 1 个通用 Worker 的模型、附加提示词和预算上限（只能收紧，不能放宽硬上限）。"
+            "角色字段仍是配置标签，不会增加 Agent 数量；MCP / Skill 未授予任何执行权限。"
+            "候选 Finding 必须带代码证据且保持 UNREVIEWED/PENDING，只有人工复核才能确认。"
+            "effective_model 来自现有 LLM 设置解析，此端点不做任何模型调用。"
         ),
     }
 

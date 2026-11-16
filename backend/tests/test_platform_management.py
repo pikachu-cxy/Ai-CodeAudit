@@ -67,15 +67,20 @@ class PlatformManagementApiTests(unittest.TestCase):
 
     # ---------------- Stage B: Agent definitions ----------------
 
-    def test_agent_crud_and_configuration_only_contract(self):
+    def test_agent_crud_and_deep_audit_wiring_contract(self):
         async def scenario(client, factory):
             caps = await client.get("/api/agents/capabilities")
             self.assertEqual(caps.status_code, 200)
             body = caps.json()
-            self.assertFalse(body["execution_wired"])
-            self.assertIsNone(body["scheduler"])
-            self.assertIsNone(body["blackboard"])
-            self.assertEqual(body["runtime_status"], "configuration_only")
+            # Deep Audit V1 wired a single Planner -> Worker runtime. MCP / Skill
+            # execution permission is still explicitly NOT granted.
+            self.assertTrue(body["execution_wired"])
+            self.assertTrue(body["scheduler"])
+            self.assertTrue(body["blackboard"])
+            self.assertEqual(body["runtime_status"], "deep_audit_v1_single_worker")
+            self.assertEqual(body["deep_audit"]["worker_count"], 1)
+            self.assertFalse(body["deep_audit"]["mcp_tools_granted"])
+            self.assertFalse(body["deep_audit"]["skills_granted"])
             self.assertTrue(body["resolved_models"]["agent"])
 
             created = await client.post(
@@ -92,7 +97,7 @@ class PlatformManagementApiTests(unittest.TestCase):
             row = created.json()
             self.assertEqual(row["slug"], "code-worker")
             self.assertEqual(row["max_files"], 24)
-            self.assertFalse(row["execution_wired"])
+            self.assertTrue(row["execution_wired"])
             self.assertEqual(row["effective_model"], body["resolved_models"]["agent"])
             agent_id = row["id"]
 

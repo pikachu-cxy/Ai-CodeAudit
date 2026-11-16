@@ -1126,6 +1126,196 @@ export interface AgentCapabilities {
   budget_ranges: Record<string, [number, number]>;
   agent_tool_round_limit: number;
   note: string;
+  deep_audit?: {
+    mode: string;
+    worker_count: number;
+    worker_mode: string;
+    allowed_tools: string[];
+    mcp_tools_granted: boolean;
+    skills_granted: boolean;
+    finding_evidence_required: boolean;
+    auto_confirm: boolean;
+    legacy_llm_audit_preserved: boolean;
+  };
+}
+
+// ============ Deep Audit V1: opt-in Planner / Worker / blackboard ============
+
+export type DeepAuditFocus = "authz" | "injection" | "business_logic";
+
+export interface DeepAuditScope {
+  focus: DeepAuditFocus[];
+  path_prefixes?: string[];
+  max_tasks?: number;
+}
+
+export interface DeepAuditBudgetSettings {
+  max_llm_rounds: number;
+  max_tool_calls: number;
+  max_total_tokens: number;
+}
+
+export interface DeepAuditCapabilities {
+  mode: string;
+  execution_wired: boolean;
+  runtime_status: string;
+  planner: string;
+  worker_count: number;
+  blackboard: string[];
+  allowed_tools: string[];
+  mcp_tools_granted: boolean;
+  skills_granted: boolean;
+  llm_configured: boolean;
+  worker_mode: string;
+  focus: { key: DeepAuditFocus; label: string }[];
+  policy: Record<string, number>;
+  legacy_llm_audit_preserved: boolean;
+  note: string;
+}
+
+export interface DeepAuditPlanTask {
+  task_type: string;
+  goal: string;
+  priority: number;
+  fingerprint: string;
+  status: string;
+  result_summary: string;
+}
+
+export interface DeepAuditPlan {
+  scan_id: number;
+  revision: string;
+  scope: {
+    focus: string[];
+    path_prefixes: string[];
+    max_tasks: number;
+    labels: Record<string, string>;
+  };
+  tasks: DeepAuditPlanTask[];
+}
+
+export interface DeepAuditBudgetUsage {
+  policy?: Record<string, number>;
+  llm_rounds?: number;
+  tool_calls?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  estimated_tokens?: number;
+  total_tokens?: number;
+  llm_ms?: number;
+  tool_ms?: number;
+  elapsed_seconds?: number;
+  exhausted_dimension?: string | null;
+}
+
+export interface DeepAuditRun {
+  id: number;
+  scan_id: number;
+  status: string;
+  agent_slug: string;
+  agent_definition_id: number | null;
+  repository_revision: string;
+  config_snapshot: Record<string, unknown>;
+  scope: {
+    focus?: string[];
+    path_prefixes?: string[];
+    max_tasks?: number;
+    labels?: Record<string, string>;
+  };
+  budget_usage: DeepAuditBudgetUsage;
+  error_message: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string | null;
+  is_active: boolean;
+}
+
+export interface DeepAuditEvidence {
+  id: number;
+  fact_id: number;
+  repository_revision: string;
+  file_path: string;
+  line_start: number;
+  line_end: number;
+  content_hash: string;
+  evidence_type: string;
+  evidence_summary: string;
+  created_at: string | null;
+}
+
+export interface DeepAuditFact {
+  id: number;
+  run_id: number;
+  task_id: number | null;
+  fact_type: string;
+  summary: string;
+  source: string;
+  confidence: number;
+  fingerprint: string;
+  finding_id: number | null;
+  metadata: Record<string, unknown>;
+  created_at: string | null;
+  evidence: DeepAuditEvidence[];
+}
+
+export interface DeepAuditTaskState {
+  id: number;
+  agent_id: string;
+  task_type: string;
+  goal: string;
+  status: string;
+  priority: number;
+  result_summary: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface DeepAuditConfirmedFinding {
+  id: number;
+  rule_id: string;
+  severity: string;
+  file_path: string;
+  line_start: number;
+  message: string;
+}
+
+export interface DeepAuditSummary {
+  run: {
+    id: number;
+    scan_id: number;
+    status: string;
+    repository_revision: string;
+    agent_slug: string;
+    started_at: string | null;
+    finished_at: string | null;
+    error_message: string | null;
+    scope: DeepAuditRun["scope"];
+    config_snapshot: Record<string, unknown>;
+    is_active?: boolean;
+  };
+  scan_id: number;
+  current_agent: string;
+  current_task: {
+    id: number;
+    task_type: string;
+    goal: string;
+    status: string;
+    priority: number;
+  } | null;
+  tasks: DeepAuditTaskState[];
+  budget_usage: DeepAuditBudgetUsage;
+  fact_counts: Record<string, number>;
+  shared_facts: DeepAuditFact[];
+  candidates: DeepAuditFact[];
+  confirmed_findings: DeepAuditConfirmedFinding[];
+}
+
+export interface DeepAuditEvent {
+  id: number;
+  level: string;
+  event_type: string;
+  payload: Record<string, unknown>;
+  created_at: string | null;
 }
 
 export interface McpServer {
@@ -1468,6 +1658,52 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
+  async streamAgentChat(
+    id: number,
+    body: { message: string; max_history?: number },
+    update: (event: "progress" | "reply", data: string) => void,
+  ): Promise<AgentChatResponse> {
+    const url = `${candidateBases()[0]}/scans/${id}/agent-chat/stream`;
+    const send = () => fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(authToken && { Authorization: `Bearer ${authToken}` }) },
+      body: JSON.stringify(body),
+    });
+    let response = await send();
+    if (response.status === 401) {
+      if (await refreshAuth()) response = await send();
+      if (response.status === 401) {
+        clearAllTokens();
+        onUnauthorized?.();
+      }
+    }
+    if (!response.ok || !response.body) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(parseErrorDetail(error.detail) || `对话请求失败（${response.status}）`);
+    }
+    const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+    let pending = "";
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        pending += value;
+        const lines = pending.split("\n");
+        pending = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const message = JSON.parse(line);
+          if (message.event === "done") return message.data;
+          if (message.event === "error") throw new Error(message.data);
+          if (message.event === "progress" || message.event === "reply") update(message.event, message.data);
+        }
+      }
+      throw new Error("对话连接已中断，请重新载入消息。");
+    } finally {
+      await reader.cancel().catch(() => undefined);
+      reader.releaseLock();
+    }
+  },
   runAgentTask: (id: number, body: { mode: AgentTaskMode; scope?: { categories?: FindingCategory[]; max_items?: number }; options?: { top_n?: number } }) =>
     request<AgentTaskResponse>(`/scans/${id}/agent-tasks`, {
       method: "POST",
@@ -1775,6 +2011,57 @@ export const api = {
     }),
   deleteAgent: (id: number) =>
     request<{ ok: boolean; id: number; slug: string }>(`/agents/${id}`, { method: "DELETE" }),
+
+  // ---- Deep Audit V1: opt-in Planner / Worker / blackboard ----
+  getDeepAuditBudget: () => request<DeepAuditBudgetSettings>("/deep-audit/settings"),
+  updateDeepAuditBudget: (budget: DeepAuditBudgetSettings) =>
+    request<DeepAuditBudgetSettings>("/deep-audit/settings", {
+      method: "PUT",
+      body: JSON.stringify(budget),
+    }),
+  deepAuditCapabilities: () => request<DeepAuditCapabilities>("/deep-audit/capabilities"),
+  deepAuditPlan: (scanId: number, scope: DeepAuditScope) =>
+    request<DeepAuditPlan>(`/scans/${scanId}/deep-audit/plan`, {
+      method: "POST",
+      body: JSON.stringify(scope),
+    }),
+  deepAuditStart: (scanId: number, body: DeepAuditScope & { agent_slug?: string | null }) =>
+    request<{ ok: boolean; run: DeepAuditRun }>(`/scans/${scanId}/deep-audit/runs`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  deepAuditRuns: (scanId: number) =>
+    request<{ runs: DeepAuditRun[] }>(`/scans/${scanId}/deep-audit/runs`),
+  deepAuditSummary: (runId: number) =>
+    request<DeepAuditSummary>(`/deep-audit/runs/${runId}`),
+  deepAuditFacts: (runId: number, factType?: string) =>
+    request<{ facts: DeepAuditFact[]; count: number }>(
+      `/deep-audit/runs/${runId}/facts${factType ? `?fact_type=${encodeURIComponent(factType)}` : ""}`,
+    ),
+  deepAuditEvents: (runId: number, limit = 40) =>
+    request<{ events: DeepAuditEvent[]; count: number }>(
+      `/deep-audit/runs/${runId}/events?limit=${limit}`,
+    ),
+  deepAuditCancel: (runId: number) =>
+    request<{ ok: boolean; run_id: number; active: boolean; status: string }>(
+      `/deep-audit/runs/${runId}/cancel`,
+      { method: "POST" },
+    ),
+  deepAuditResume: (runId: number) =>
+    request<{ ok: boolean; run: DeepAuditRun }>(`/deep-audit/runs/${runId}/resume`, {
+      method: "POST",
+    }),
+  deepAuditConfirmFinding: (runId: number, findingId: number, reviewNote = "") =>
+    request<{
+      ok: boolean;
+      finding_id: number;
+      review_status: string;
+      ai_verdict: string;
+      review_note: string;
+    }>(`/deep-audit/runs/${runId}/findings/${findingId}/confirm`, {
+      method: "POST",
+      body: JSON.stringify({ review_note: reviewNote }),
+    }),
 
   // ---- Phase 2: MCP server registry ----
   listMcpServers: () => request<McpServer[]>("/mcp/servers"),

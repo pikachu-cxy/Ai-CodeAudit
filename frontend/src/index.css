@@ -133,66 +133,9 @@ body {
   background: rgb(239 68 68 / 0.12);
 }
 
-.chat-shell {
-  background: var(--bg-sidebar);
-  border-color: var(--border-subtle);
-}
-
-.chat-shell-resizing {
-  box-shadow: 0 -8px 24px rgb(6 182 212 / 0.08);
-}
-
-.chat-resize-handle {
-  position: relative;
-  height: 14px;
-  margin-top: -2px;
-}
-
-.chat-resize-handle:hover .chat-resize-bar,
-.chat-shell-resizing .chat-resize-bar {
-  background: rgb(34 211 238 / 0.7);
-}
-
-.chat-resize-bar {
-  display: block;
-  width: 42px;
-  height: 3px;
-  border-radius: 999px;
-  background: rgb(100 116 139 / 0.55);
-  transition: background 0.15s ease;
-}
-
 .finding-row-highlight {
   background: rgb(6 182 212 / 0.06);
   box-shadow: inset 3px 0 0 rgb(6 182 212 / 0.75);
-}
-
-.chat-shortcut {
-  color: var(--text-secondary);
-  border-color: rgb(6 182 212 / 0.25);
-}
-
-.chat-shortcut:hover:not(:disabled) {
-  color: var(--text-primary);
-  border-color: rgb(6 182 212 / 0.45);
-}
-
-.chat-bubble {
-  color: var(--text-primary);
-}
-
-.chat-bubble-label {
-  color: var(--text-muted);
-}
-
-.chat-bubble-user {
-  background: rgb(0 0 0 / 0.22);
-  border-color: var(--border-default);
-}
-
-.chat-bubble-assistant {
-  background: rgb(6 182 212 / 0.12);
-  border-color: rgb(6 182 212 / 0.28);
 }
 
 .tab-chip {
@@ -455,3 +398,28 @@ body {
   .page-container { padding: 1rem 0.85rem 1.5rem; }
 }
 
+
+
+.audit-conversations {
+  --conversation-canvas: #f7f7f7;
+  --conversation-panel: #fff;
+  --conversation-border: #e2e2e2;
+  --conversation-muted: #f3f3f3;
+  --conversation-text: #191919;
+  --conversation-secondary: #686868;
+  --conversation-action: #191919;
+  --conversation-action-text: #fff;
+  color: var(--conversation-text);
+  background: var(--conversation-canvas);
+}
+
+[data-theme="dark"] .audit-conversations {
+  --conversation-canvas: #131313;
+  --conversation-panel: #1a1a1a;
+  --conversation-border: #383838;
+  --conversation-muted: #272727;
+  --conversation-text: #f4f4f4;
+  --conversation-secondary: #b3b3b3;
+  --conversation-action: #f4f4f4;
+  --conversation-action-text: #191919;
+}

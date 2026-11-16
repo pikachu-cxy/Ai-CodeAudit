@@ -6,7 +6,6 @@ interface Props {
   scan: ScanSummary | null;
   stats: ScanStats | null;
   events: ScanEvent[];
-  highlightedCount?: number;
 }
 
 const PHASE_LABELS: Record<string, string> = {
@@ -25,7 +24,7 @@ function eventIcon(level: string) {
   return <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />;
 }
 
-export function AgentPanel({ scan, stats, events, highlightedCount = 0 }: Props) {
+export function AgentPanel({ scan, stats, events }: Props) {
   const critical = stats?.by_severity?.CRITICAL ?? 0;
   const high = stats?.by_severity?.HIGH ?? 0;
   const agentEvents = events
@@ -66,11 +65,6 @@ export function AgentPanel({ scan, stats, events, highlightedCount = 0 }: Props)
                 <span className="text-orange-400">{high} H</span>
               </span>
             </div>
-            {highlightedCount > 0 && (
-              <p className="text-[10px] text-cyan-300/80 pt-1 border-t border-cyan-500/10">
-                列表已高亮 {highlightedCount} 条相关漏洞
-              </p>
-            )}
           </div>
         )}
       </div>

@@ -2,7 +2,10 @@ import enum
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    Boolean, DateTime, Enum, Float, ForeignKey, Index, Integer, String,
+    Text, UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -317,7 +320,7 @@ class RefreshToken(Base):
 
 
 class AgentDefinition(Base):
-    """Agent configuration records. No scheduler consumes these rows yet."""
+    """Agent configuration optionally selected for the Deep Audit worker."""
 
     __tablename__ = "agent_definitions"
 
@@ -385,3 +388,161 @@ class PlatformAuditLog(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True
     )
+
+
+# ============ Deep Audit V1: shared code-fact blackboard ============
+# These are additive tables only. The existing Project / ScanTask / Finding /
+# ReviewStatus models are untouched: candidate conclusions are linked back to
+# the SAME Finding entity through AuditFact.finding_id.
+
+
+class AuditRunStatus(str, enum.Enum):
+    PENDING = "pending"
+    PLANNING = "planning"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+
+class AuditTaskStatus(str, enum.Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+
+
+class AuditFactType(str, enum.Enum):
+    CODE_FACT = "code_fact"                 # completed code investigation
+    VULN_HYPOTHESIS = "vuln_hypothesis"     # unverified hypothesis
+    CANDIDATE_FINDING = "candidate_finding" # evidence-backed candidate
+
+
+class AuditRun(Base):
+    """One Deep Audit execution for a scan. All writes go through blackboard_service."""
+
+    __tablename__ = "audit_runs"
+    __table_args__ = (Index("ix_audit_runs_scan_created", "scan_id", "created_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scan_id: Mapped[int] = mapped_column(
+        ForeignKey("scan_tasks.id", ondelete="CASCADE"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(32), default=AuditRunStatus.PENDING.value)
+    config_snapshot: Mapped[str] = mapped_column(Text, default="{}")
+    scope_json: Mapped[str] = mapped_column(Text, default="{}")
+    repository_revision: Mapped[str] = mapped_column(String(128), default="")
+    agent_slug: Mapped[str] = mapped_column(String(64), default="")
+    agent_definition_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    budget_usage: Mapped[str] = mapped_column(Text, default="{}")
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    tasks: Mapped[List["AuditTask"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan",
+        order_by="desc(AuditTask.priority), asc(AuditTask.id)",
+    )
+    facts: Mapped[List["AuditFact"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
+
+
+class AuditTask(Base):
+    """A Planner-produced unit of work; fingerprint enforces task de-duplication."""
+
+    __tablename__ = "audit_tasks"
+    __table_args__ = (
+        UniqueConstraint("run_id", "fingerprint", name="uq_audit_task_run_fingerprint"),
+        Index("ix_audit_tasks_run_status", "run_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("audit_runs.id", ondelete="CASCADE"), index=True
+    )
+    agent_id: Mapped[str] = mapped_column(String(64), default="")
+    task_type: Mapped[str] = mapped_column(String(32))
+    goal: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), default=AuditTaskStatus.PENDING.value)
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    result_summary: Mapped[str] = mapped_column(Text, default="")
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    scope_json: Mapped[str] = mapped_column(Text, default="{}")
+    budget_usage: Mapped[str] = mapped_column(Text, default="{}")
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    run: Mapped["AuditRun"] = relationship(back_populates="tasks")
+    facts: Mapped[List["AuditFact"]] = relationship(back_populates="task")
+
+
+class AuditFact(Base):
+    """Shared, de-duplicated fact readable by every Worker in the run."""
+
+    __tablename__ = "audit_facts"
+    __table_args__ = (
+        UniqueConstraint("run_id", "fingerprint", name="uq_audit_fact_run_fingerprint"),
+        Index("ix_audit_facts_run_type", "run_id", "fact_type"),
+        Index("ix_audit_facts_fingerprint", "fingerprint"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("audit_runs.id", ondelete="CASCADE"), index=True
+    )
+    task_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("audit_tasks.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    fact_type: Mapped[str] = mapped_column(String(32))
+    summary: Mapped[str] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(String(255), default="")
+    confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    finding_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("findings.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    metadata_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    run: Mapped["AuditRun"] = relationship(back_populates="facts")
+    task: Mapped[Optional["AuditTask"]] = relationship(back_populates="facts")
+    evidence: Mapped[List["AuditEvidence"]] = relationship(
+        back_populates="fact", cascade="all, delete-orphan"
+    )
+
+
+class AuditEvidence(Base):
+    """Code evidence bound to a concrete repository revision and content hash."""
+
+    __tablename__ = "audit_evidence"
+    __table_args__ = (
+        UniqueConstraint("fact_id", "fingerprint", name="uq_audit_evidence_fact_fingerprint"),
+        Index("ix_audit_evidence_fact", "fact_id"),
+        Index("ix_audit_evidence_revision", "repository_revision"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    fact_id: Mapped[int] = mapped_column(
+        ForeignKey("audit_facts.id", ondelete="CASCADE"), index=True
+    )
+    fingerprint: Mapped[str] = mapped_column(String(64), default="")
+    repository_revision: Mapped[str] = mapped_column(String(128), default="")
+    file_path: Mapped[str] = mapped_column(String(1024))
+    line_start: Mapped[int] = mapped_column(Integer, default=0)
+    line_end: Mapped[int] = mapped_column(Integer, default=0)
+    content_hash: Mapped[str] = mapped_column(String(64), default="")
+    evidence_type: Mapped[str] = mapped_column(String(32), default="code_slice")
+    evidence_summary: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    fact: Mapped["AuditFact"] = relationship(back_populates="evidence")

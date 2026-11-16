@@ -57,16 +57,8 @@
 
 安装脚本 `backend/scripts/install-scanner-tools.sh` 在构建末尾逐个校验可执行文件，缺失即让构建失败，避免出现「容器起来了但扫描器全不可用」。
 
-## 6. 能力边界（务必如实理解）
+## 6. Deep Audit V1 与平台能力
 
-| 已具备 | **不**具备 |
-| --- | --- |
-| Agent 配置定义的增删改查与持久化 | Planner/Worker 调度器、代码事实黑板、Agent 执行链路 |
-| 从现有 LLM 设置解析有效模型 | 按 Agent 记录发起模型调用、任务分发 |
-| MCP Server 注册与一次真实 `initialize` 握手 | 工具枚举/调用、stdio 进程启动、Agent 绑定 MCP |
-| SSRF 防护与凭据类 Header 拒存 | 凭据加密存储、动态 PoC 验证 |
-| 单 admin 改密、会话撤销、平台操作留痕 | 多用户/RBAC/按用户数据隔离 |
+扫描任务结束后，Agent 配置页和任务详情页可启动 Deep Audit V1。调度器从原有扫描结果、接口发现和同版本黑板准备输入。Planner 只处理结构化数据，单个 Worker 顺序调用只读源码工具。SQLAlchemy 将运行、任务、事实和证据持久化到现有数据库。带证据的候选进入现有 Finding，由人工复核。原端点审计、数据流研判和扫描上下文对话各自保留入口。
 
-`GET /api/agents/capabilities` 返回 `runtime_status=configuration_only`、`execution_wired=false`。**配置页不等于已具备多 Agent 代码审计执行能力。**
-
-Skill 管理入口在后端 `/api/skills` 未部署时会显示「后端未部署」，不渲染管理器、不填充示例数据。
+AgentDefinition 可绑定 Worker 的模型、附加指示与预算。MCP Server 管理仍提供配置与一次初始化握手，Skill 页面依赖已部署的管理 API。V1 的工具白名单只包含本地只读代码工具。接口、迁移、验收和限制见 [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md)。

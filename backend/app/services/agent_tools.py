@@ -16,6 +16,7 @@ from app.services.endpoint_discovery_service import (
     list_endpoints_summary,
 )
 from app.services.file_service import locate_text_in_project, resolve_project_file
+from app.services.tool_log_redaction import redact_arguments
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,9 @@ def _search_related_batch_candidates(
     hits: list[dict],
     limit: int = 5,
     cancel_check: Callable[[], None] | None = None,
+    *,
+    source_files: tuple[Path, ...] | None = None,
+    read_source: Callable[[Path], str] | None = None,
 ) -> list[dict]:
     root = project_path.resolve()
     candidates: list[dict] = []
@@ -110,8 +114,8 @@ def _search_related_batch_candidates(
 
         name = resolved.name.lower()
         parent_blob = " ".join(part.lower() for part in resolved.parts)
-        if "controller" in name or "controller" in parent_blob:
-            for svc in find_related_service_files(root, resolved, max_files=3, cancel_check=cancel_check):
+        if source_files is not None or "controller" in name or "controller" in parent_blob:
+            for svc in find_related_service_files(root, resolved, max_files=3, cancel_check=cancel_check, source_files=source_files, read_source=read_source):
                 add(svc, "related_service")
 
         if len(candidates) >= limit:
@@ -126,6 +130,9 @@ def execute_agent_tool(
     arguments: dict | None,
     *,
     scan_id: int | None = None,
+    source_files: tuple[Path, ...] | None = None,
+    read_source: Callable[[Path], str] | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> str:
     """Run a tool and return JSON string result."""
     args = arguments or {}
@@ -133,26 +140,14 @@ def execute_agent_tool(
     started = time.perf_counter()
     ok = False
     out: str | None = None
-    cancel_check = (lambda: check_llm_audit_cancel(scan_id)) if scan_id is not None else None
+    if scan_id is not None and cancel_check is None:
+        cancel_check = lambda: check_llm_audit_cancel(scan_id)
 
     def _arg_preview() -> dict:
-        preview: dict = {}
-        for k, v in args.items():
-            ks = str(k)
-            if ks in {"query", "file_hint", "path"}:
-                preview[ks] = (str(v)[:120] + "...") if v else ""
-            elif ks in {"limit", "start_line", "end_line", "max_files", "max_related_files"}:
-                try:
-                    preview[ks] = int(v)
-                except Exception:
-                    preview[ks] = v
-            elif ks == "files" and isinstance(v, list):
-                preview[ks] = f"{len(v)} items"
-            else:
-                preview[ks] = v if isinstance(v, (str, int, float, bool)) else type(v).__name__
-        return preview
+        # Never log secret-bearing values or full file contents.
+        return redact_arguments(args)
 
-    tool_preview = str(tool or "").strip() or "unknown"
+    tool_preview = tool if tool in {"list_endpoints", "list_controllers", "read_file", "read_files_batch", "search_code"} else "unknown"
 
     try:
         if tool == "list_endpoints":
@@ -160,7 +155,7 @@ def execute_agent_tool(
                 root,
                 filter_text=str(args.get("filter") or ""),
                 limit=int(args.get("limit") or 40),
-                cancel_check=cancel_check,
+                cancel_check=cancel_check, source_files=source_files, read_source=read_source,
             )
             out = json.dumps({"ok": True, "count": len(rows), "endpoints": rows}, ensure_ascii=False)
             ok = True
@@ -168,7 +163,11 @@ def execute_agent_tool(
 
         if tool == "list_controllers":
             limit = int(args.get("limit") or 20)
-            units = discover_controller_units(root, cancel_check=cancel_check)[:limit]
+            units = discover_controller_units(
+                root, cancel_check=cancel_check, source_files=source_files, read_source=read_source,
+            )
+            needle = str(args.get("filter") or "").casefold()
+            units = [unit for unit in units if needle in f"{unit.file} {unit.class_name}".casefold()][:limit]
             payload = [
                 {
                     "file": u.file,
@@ -190,13 +189,25 @@ def execute_agent_tool(
                 out = json.dumps({"ok": False, "error": "缺少 path"}, ensure_ascii=False)
                 return out
             resolved = resolve_project_file(root, rel)
+            file_limit = max(4096, int(settings.agent_tool_max_file_bytes))
+            if resolved.stat().st_size > file_limit:
+                out = json.dumps(
+                    {"ok": False, "error": f"文件超过 {file_limit} 字节上限，请缩小读取范围"},
+                    ensure_ascii=False,
+                )
+                return out
             text = resolved.read_text(encoding="utf-8", errors="replace")
             lines = text.splitlines()
             total = len(lines)
-            start = max(1, int(args.get("start_line") or 1))
-            end = min(total, int(args.get("end_line") or min(total, start + 180)))
+            line_cap = max(10, int(settings.agent_tool_max_lines))
+            start = max(1, min(int(args.get("start_line") or 1), max(1, total)))
+            requested_end = int(args.get("end_line") or min(total, start + line_cap - 1))
+            end = min(total, max(start, requested_end), start + line_cap - 1)
             chunk = "\n".join(f"{i:4d}| {lines[i-1]}" for i in range(start, end + 1))
-            max_chars = settings.llm_audit_file_max_chars
+            max_chars = min(
+                max(500, int(settings.llm_audit_file_max_chars)),
+                max(500, int(settings.agent_tool_max_output_chars)),
+            )
             if len(chunk) > max_chars:
                 chunk = chunk[:max_chars] + "\n... [truncated]"
             out = json.dumps(
@@ -218,7 +229,8 @@ def execute_agent_tool(
             if not isinstance(files, list) or not files:
                 out = json.dumps({"ok": False, "error": "缺少 files"}, ensure_ascii=False)
                 return out
-            per_file_limit = max(1000, min(int(args.get("per_file_char_limit") or 4000), 12000))
+            output_cap = max(500, int(settings.agent_tool_max_output_chars))
+            per_file_limit = max(1000, min(int(args.get("per_file_char_limit") or 4000), output_cap))
             payload = []
             for item in files[:8]:
                 if not isinstance(item, dict):
@@ -227,11 +239,17 @@ def execute_agent_tool(
                 if not rel:
                     continue
                 resolved = resolve_project_file(root, rel)
+                file_limit = max(4096, int(settings.agent_tool_max_file_bytes))
+                if resolved.stat().st_size > file_limit:
+                    payload.append({"path": rel, "error": f"文件超过 {file_limit} 字节上限"})
+                    continue
                 text = resolved.read_text(encoding="utf-8", errors="replace")
                 lines = text.splitlines()
                 total = len(lines)
-                start = max(1, int(item.get("start_line") or 1))
-                end = min(total, int(item.get("end_line") or min(total, start + 180)))
+                line_cap = max(10, int(settings.agent_tool_max_lines))
+                start = max(1, min(int(item.get("start_line") or 1), max(1, total)))
+                requested_end = int(item.get("end_line") or min(total, start + line_cap - 1))
+                end = min(total, max(start, requested_end), start + line_cap - 1)
                 chunk = "\n".join(f"{i:4d}| {lines[i-1]}" for i in range(start, end + 1))
                 if len(chunk) > per_file_limit:
                     chunk = chunk[:per_file_limit] + "\n... [truncated]"
@@ -282,9 +300,11 @@ def execute_agent_tool(
                 max_scan_seconds=max_scan_seconds,
                 max_files_scanned=max_files_scanned,
                 cancel_check=cancel_check,
-                max_file_bytes=max_file_bytes,
+                max_file_bytes=max_file_bytes, source_files=source_files, read_source=read_source,
             )
-            related_batch_candidates = _search_related_batch_candidates(root, hits, cancel_check=cancel_check)
+            related_batch_candidates = _search_related_batch_candidates(
+                root, hits, cancel_check=cancel_check, source_files=source_files, read_source=read_source,
+            )
             out = json.dumps(
                 {
                     "ok": True,

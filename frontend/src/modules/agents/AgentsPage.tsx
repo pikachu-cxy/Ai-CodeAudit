@@ -5,7 +5,10 @@ import {
   type AgentCapabilities,
   type AgentDefinition,
   type AgentPayload,
+  type DeepAuditFocus,
+  type ScanSummary,
 } from "../../api";
+import { DeepAuditLauncher } from "../../components/DeepAuditPanel";
 import type { PageContext } from "../../app/pageTypes";
 import { useAsyncData } from "../../shared/hooks/useAsyncData";
 import {
@@ -54,6 +57,17 @@ function formatDate(value: string | null): string {
 export function AgentsPage(ctx: PageContext) {
   const list = useAsyncData<AgentDefinition[]>(() => api.listAgents(), [ctx.refreshKey]);
   const caps = useAsyncData<AgentCapabilities>(() => api.getAgentCapabilities(), []);
+  const scans = useAsyncData<ScanSummary[]>(
+    () => api.listScans({ archived: "false" }),
+    [ctx.refreshKey],
+  );
+  const [launchScanId, setLaunchScanId] = useState<number | null>(null);
+  const [launchAgentSlug, setLaunchAgentSlug] = useState("");
+  const [launchFocus, setLaunchFocus] = useState<DeepAuditFocus[]>([
+    "authz",
+    "injection",
+    "business_logic",
+  ]);
   const [editor, setEditor] = useState<{ mode: "create" | "edit"; id?: number } | null>(null);
   const [form, setForm] = useState<AgentPayload>(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
@@ -101,7 +115,10 @@ export function AgentsPage(ctx: PageContext) {
       setEditor(null);
       list.reload();
       ctx.onDataChanged();
-      setMessage({ tone: "success", text: "Agent 配置已保存。这只是一条配置记录，未创建任何可执行 Agent。" });
+      setMessage({
+        tone: "success",
+        text: "Agent 配置已保存。启用后可在下方「启动 Deep Audit V1」中选中它，用于收紧唯一通用 Worker 的模型与预算；保存本身不会启动审计。",
+      });
     } catch (err) {
       setMessage({ tone: "error", text: `保存失败：${errorText(err)}` });
     } finally {
@@ -130,7 +147,7 @@ export function AgentsPage(ctx: PageContext) {
       <PageHeader
         eyebrow="Platform / Agents"
         title="Agent 配置"
-        description="维护 Agent 角色定义、模型绑定与执行预算。配置会真实写入后端，但当前没有调度器消费这些记录。"
+        description="维护 Agent 角色定义、模型绑定与执行预算。启用的定义可被 Deep Audit V1 选中，作用于唯一的通用 Worker；原有扫描与 LLM 链路不受影响。"
         actions={
           <button type="button" className="btn-primary inline-flex items-center gap-1.5" onClick={openCreate}>
             <Plus className="h-3.5 w-3.5" /> 新增 Agent 配置
@@ -138,9 +155,10 @@ export function AgentsPage(ctx: PageContext) {
         }
       />
 
-      <CapabilityNotice title="已实现配置管理，尚未实现 Agent 执行">
-        本页面提供真实的增删改查、字段校验、模型解析和操作留痕。但系统里<strong>没有 Planner / Worker 调度器、代码事实黑板或多 Agent 执行链路</strong>：
-        保存或启用一条记录不会触发任何审计任务，也不会改变现有扫描流程。<MonoMeta>effective_model</MonoMeta> 来自现有 LLM 设置的真实解析，不进行模型调用。
+      <CapabilityNotice title="Deep Audit V1 已接入：单 Worker 执行，不是多 Agent 编排" tone="cyan">
+        已接入 Planner → <strong>1 个通用 Worker</strong> → 代码事实黑板 → 现有 Finding 体系的可选执行模式。
+        启用的 AgentDefinition 只用于调整这个 Worker 的模型、附加提示词与预算上限，<strong>不会增加 Agent 数量</strong>；
+        MCP / Skill 均未授予执行权限。无代码证据不会创建 Finding，候选一律 <MonoMeta>UNREVIEWED / PENDING</MonoMeta>，必须人工确认。
       </CapabilityNotice>
 
       {message && <InlineMessage tone={message.tone}>{message.text}</InlineMessage>}
@@ -158,8 +176,11 @@ export function AgentsPage(ctx: PageContext) {
             <KeyValueRow label="运行状态">
               <StatusPill tone="warning">{capabilities.runtime_status}</StatusPill>
             </KeyValueRow>
-            <KeyValueRow label="调度器 / 黑板">
-              <StatusPill tone="muted">未接入</StatusPill>
+            <KeyValueRow label="调度器">
+              <MonoMeta>{capabilities.scheduler || "—"}</MonoMeta>
+            </KeyValueRow>
+            <KeyValueRow label="黑板">
+              <MonoMeta>{capabilities.blackboard || "—"}</MonoMeta>
             </KeyValueRow>
             <KeyValueRow label="LLM 已配置">
               <StatusPill tone={capabilities.llm_configured ? "success" : "warning"}>
@@ -171,11 +192,79 @@ export function AgentsPage(ctx: PageContext) {
             <KeyValueRow label="agent 任务模型"><MonoMeta>{capabilities.resolved_models.agent}</MonoMeta></KeyValueRow>
             <KeyValueRow label="工具轮次上限"><MonoMeta>{capabilities.agent_tool_round_limit}</MonoMeta></KeyValueRow>
             <KeyValueRow label="可用模型绑定"><MonoMeta>{capabilities.model_tasks.join(" / ")}</MonoMeta></KeyValueRow>
+            <KeyValueRow label="Worker 数量 / 模式">
+              <MonoMeta>
+                {capabilities.deep_audit?.worker_count ?? 1} / {capabilities.deep_audit?.worker_mode ?? "—"}
+              </MonoMeta>
+            </KeyValueRow>
+            <KeyValueRow label="MCP / Skill 授权">
+              <StatusPill tone="muted">未授予执行权限</StatusPill>
+            </KeyValueRow>
             <div className="md:col-span-2 pt-2 text-xs leading-relaxed text-[var(--text-muted)]">
               {capabilities.note}
             </div>
           </div>
         ) : null}
+      </SectionCard>
+
+      <SectionCard
+        title="启动 Deep Audit V1"
+        description="选择一个真实扫描任务和一条已启用的 AgentDefinition。Planner 只做纯数据规划，执行由唯一的只读 Worker 完成；不会自动授权 MCP / Skill。"
+      >
+        <div className="grid gap-3 md:grid-cols-2">
+          <Field label="扫描任务" hint="仅列出未归档的真实扫描任务。">
+            <select
+              className="input"
+              value={launchScanId ?? ""}
+              onChange={(event) =>
+                setLaunchScanId(event.target.value ? Number(event.target.value) : null)
+              }
+            >
+              <option value="">请选择扫描任务</option>
+              {(scans.data ?? []).map((scan) => (
+                <option key={scan.id} value={scan.id}>
+                  #{scan.id} · {scan.name}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Agent 定义" hint="只有启用状态的定义可选；留空使用内置默认 Worker。">
+            <select
+              className="input"
+              value={launchAgentSlug}
+              onChange={(event) => setLaunchAgentSlug(event.target.value)}
+            >
+              <option value="">内置默认 Worker</option>
+              {(list.data ?? []).filter((row) => row.enabled).map((row) => (
+                <option key={row.id} value={row.slug}>
+                  {row.name} · {row.slug}
+                </option>
+              ))}
+            </select>
+          </Field>
+        </div>
+        {launchScanId ? (
+          <div className="mt-4">
+            <DeepAuditLauncher
+              scanId={launchScanId}
+              agentSlug={launchAgentSlug || undefined}
+              focus={launchFocus}
+              onFocusChange={setLaunchFocus}
+              onStarted={(runId) => {
+                setMessage({
+                  tone: "success",
+                  text: `Deep Audit 运行 #${runId} 已启动。可在该扫描任务详情页查看共享事实、代码证据与候选漏洞。`,
+                });
+                ctx.onDataChanged();
+              }}
+            />
+          </div>
+        ) : (
+          <div className="mt-4">
+            <InlineMessage tone="info">先选择一个扫描任务，再预览 Planner 任务或直接启动。</InlineMessage>
+          </div>
+        )}
+        {scans.error && <div className="mt-3"><InlineMessage tone="error">读取扫描任务失败：{scans.error}</InlineMessage></div>}
       </SectionCard>
 
       <SectionCard
@@ -239,7 +328,11 @@ export function AgentsPage(ctx: PageContext) {
                       <StatusPill tone={row.enabled ? "success" : "muted"}>
                         {row.enabled ? "已启用配置" : "已停用"}
                       </StatusPill>
-                      <div className="mt-1"><StatusPill tone="muted">未接执行</StatusPill></div>
+                      <div className="mt-1">
+                        <StatusPill tone={row.enabled ? "accent" : "muted"}>
+                          {row.enabled ? "可选作 Deep Audit Worker" : "停用不可选"}
+                        </StatusPill>
+                      </div>
                     </td>
                     <td className="px-4 py-3 text-[var(--text-muted)]">{formatDate(row.updated_at)}</td>
                     <td className="px-4 py-3">
@@ -263,7 +356,7 @@ export function AgentsPage(ctx: PageContext) {
       {editor && (
         <Modal
           title={editor.mode === "create" ? "新增 Agent 配置" : `编辑 ${form.slug}`}
-          description="保存后仅写入配置表；不会创建可执行 Agent，也不会发起审计任务。"
+          description="保存后写入配置表；启用后可在「启动 Deep Audit V1」中被选中。保存本身不会发起审计任务。"
           onClose={() => setEditor(null)}
           footer={
             <>
@@ -314,7 +407,7 @@ export function AgentsPage(ctx: PageContext) {
               </Field>
             </div>
             <div className="md:col-span-2">
-              <Field label="系统提示词" hint="仅为未来执行器预留的文本，当前不会被任何链路读取。">
+              <Field label="系统提示词" hint="Deep Audit V1 会将此文本作为附加指令传给唯一的通用 Worker；仍受只读工具白名单与硬预算约束。">
                 <textarea className="input min-h-[110px] font-mono text-xs" value={form.system_prompt} onChange={(e) => set({ system_prompt: e.target.value })} placeholder="You are a code audit worker…" />
               </Field>
             </div>
@@ -329,7 +422,7 @@ export function AgentsPage(ctx: PageContext) {
             </Field>
             <label className="flex items-center gap-2 self-end pb-2 text-xs text-[var(--text-secondary)]">
               <input type="checkbox" checked={form.enabled} onChange={(e) => set({ enabled: e.target.checked })} />
-              启用此配置记录（不会启动任何执行）
+              启用此配置记录（可在启动 Deep Audit 时被选中，不会自动执行）
             </label>
           </div>
         </Modal>
@@ -348,7 +441,7 @@ export function AgentsPage(ctx: PageContext) {
           }
         >
           <p className="text-sm text-[var(--text-secondary)]">
-            将删除 <MonoMeta>{deleting.slug}</MonoMeta> 这条配置记录。此操作不触及任何扫描任务或漏洞数据。
+            将删除 <MonoMeta>{deleting.slug}</MonoMeta> 这条配置记录。已完成的 Deep Audit 运行保留原有配置快照，不会被追溯改写；此操作不删除扫描任务或漏洞数据。
           </p>
         </Modal>
       )}

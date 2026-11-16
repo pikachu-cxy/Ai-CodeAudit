@@ -1622,7 +1622,7 @@ async def _run_goal_loop(
             tool_rounds += 1
             consecutive_tools += 1
             followup_hint = _tool_followup_hint(tool_name, tool_args, consecutive_tools)
-            logger.info("Agentic audit round %s tool %s %s", round_no, tool_name, tool_args)
+            logger.info("Agentic audit tool round %s completed", round_no)
 
             if scan_id:
                 trace_files: list[str] = []

@@ -9,7 +9,7 @@ from starlette.requests import Request
 from app.config import settings, validate_security_config
 from app.database import init_db
 from app.dependencies.auth import require_auth
-from app.routers import accounts, agents, auth, mcp, projects, scans, webhooks
+from app.routers import accounts, agents, auth, deep_audit, mcp, projects, scans, webhooks
 from app.services.scan_service import resume_interrupted_scans_after_restart
 
 _AUDIT_EXECUTOR = ThreadPoolExecutor(max_workers=12, thread_name_prefix="audit-pool")
@@ -68,6 +68,7 @@ app.include_router(projects.router)
 app.include_router(scans.public_router)
 app.include_router(webhooks.router)
 app.include_router(agents.router)
+app.include_router(deep_audit.router)
 app.include_router(mcp.router)
 app.include_router(accounts.router)
 

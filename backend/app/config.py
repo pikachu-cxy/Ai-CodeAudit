@@ -64,6 +64,20 @@ class Settings(BaseSettings):
     llm_endpoint_audit_max_domains: int = 3  # Top-N risk domains for Goal batches
     llm_endpoint_origin_sample_per_domain: int = 5  # sample endpoints in Understand summary
     llm_agent_max_tool_rounds: int = 10
+    # Hard ceilings for ALL code-reading agent tools (legacy chat + Deep Audit).
+    # Deep Audit may tighten these per AgentDefinition, never relax them.
+    agent_tool_max_file_bytes: int = 524288
+    agent_tool_max_lines: int = 200
+    agent_tool_max_output_chars: int = 6000
+    # Deep Audit V1 unified budgets: rounds / tool calls / tokens / wall clock.
+    deep_audit_max_llm_rounds: int = 12
+    deep_audit_max_tool_calls: int = 36
+    deep_audit_max_total_tokens: int = 60000
+    deep_audit_max_seconds: int = 600
+    deep_audit_max_tool_seconds: int = 15
+    deep_audit_max_batch_files: int = 6
+    deep_audit_max_search_chars: int = 80
+    deep_audit_max_tasks: int = 6
     # Audit behavior profile: stable | balanced | broad
     llm_audit_profile: str = "balanced"
     llm_audit_require_stronger_evidence: bool = False

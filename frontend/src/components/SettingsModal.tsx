@@ -5,6 +5,7 @@ import { ApiError, api, type ScannerInfo, type Settings } from "../api";
 import { LLM_AUDIT_FOCUS_OPTIONS, normalizeFocusAreas } from "../lib/llmAuditFocus";
 import { Settings as SettingsIcon } from "./ui";
 import { AuditSkillManager } from "./AuditSkills";
+import { DeepAuditBudgetSettings } from "./DeepAuditBudgetSettings";
 
 function generateWebhookToken(): string {
   const bytes = new Uint8Array(32);
@@ -34,6 +35,7 @@ export type SettingsSection =
   | "llm-api"
   | "llm-models"
   | "llm-auto"
+  | "deep-audit-budget"
   | "audit-strategy"
   | "audit-skills"
   | "audit-endpoint"
@@ -62,6 +64,7 @@ export const MENU_GROUPS: { id: string; label: string; items: { id: SettingsSect
       { id: "llm-api", label: "API 连接" },
       { id: "llm-models", label: "任务模型" },
       { id: "llm-auto", label: "扫描自动化" },
+      { id: "deep-audit-budget", label: "Deep Audit V1 预算" },
     ],
   },
   {
@@ -101,6 +104,7 @@ export const SECTION_TITLES: Record<SettingsSection, string> = {
   "llm-api": "LLM API 连接",
   "llm-models": "按任务配置模型",
   "llm-auto": "扫描后自动化",
+  "deep-audit-budget": "Deep Audit V1 预算",
   "audit-strategy": "审计风格与关注重点",
   "audit-skills": "审计 Skill 管理",
   "audit-endpoint": "端点驱动审计",
@@ -1147,6 +1151,9 @@ export function SettingsModal({
           </div>
         );
 
+      case "deep-audit-budget":
+        return <DeepAuditBudgetSettings onSaved={onSaved} />;
+
       case "audit-skills":
         return <AuditSkillManager />;
 
@@ -2114,9 +2121,9 @@ export function SettingsModal({
           </div>
         </div>
 
-        {message && <p className="px-6 pb-2 text-sm text-accent-glow shrink-0">{message}</p>}
+        {active !== "deep-audit-budget" && message && <p className="px-6 pb-2 text-sm text-accent-glow shrink-0">{message}</p>}
 
-        <div className="flex justify-end gap-2 px-6 py-4 border-t border-surface-border shrink-0">
+        {active !== "deep-audit-budget" && <div className="flex justify-end gap-2 px-6 py-4 border-t border-surface-border shrink-0">
           {!embedded && (
             <button className="btn-ghost" onClick={onClose}>
               取消
@@ -2125,7 +2132,7 @@ export function SettingsModal({
           <button className="btn-primary" onClick={() => void save()} disabled={saving}>
             {saving ? "保存中..." : "保存"}
           </button>
-        </div>
+        </div>}
       </div>
   );
 

@@ -1,16 +1,11 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
-  type AgentChatMessage,
-  type AgentAction,
-  type AgentTaskItem,
-  type AgentTaskMode,
   type DiffStatus,
   type LlmAuditJournalEntry,
   api,
   type CodeqlFlowGraph,
   type Finding,
-  type FindingCategory,
   type ProjectSummary,
   type ReviewStatus,
   type ScanDiffSummary,
@@ -37,7 +32,7 @@ import { LlmAuditJournalPanel } from "./LlmAuditJournalPanel";
 import { SkillAuditDialog, SkillAuditHistory } from "./AuditSkills";
 import { SastDeepProgressPanel, type SastDeepJob } from "./SastDeepProgressPanel";
 import { AgentPanel } from "./AgentPanel";
-import { AuditChatBar } from "./AuditChatBar";
+import { DeepAuditPanel } from "./DeepAuditPanel";
 import { AuditReportHeader } from "./AuditReportHeader";
 import { ProjectSettingsModal } from "./ProjectSettingsModal";
 import { RetestResultsPanel } from "./RetestResultsPanel";
@@ -76,12 +71,6 @@ const TABS: { key: TabKey; label: string }[] = [
   { key: "sast", label: "SAST" },
   { key: "llm", label: "LLM发现漏洞" },
 ];
-
-function tabToFindingCategories(tab: TabKey): FindingCategory[] | undefined {
-  if (tab === "all") return undefined;
-  if (tab === "llm") return ["business_logic", "authorization"];
-  return [tab];
-}
 
 function llmFindingCount(byCategory?: Record<string, number>): number {
   if (!byCategory) return 0;
@@ -147,11 +136,6 @@ export function ScanDetailView({
   const [scanScore, setScanScore] = useState<ScanScore | null>(null);
   const [events, setEvents] = useState<ScanEvent[]>([]);
   const [codeqlGraph, setCodeqlGraph] = useState<CodeqlFlowGraph | null>(null);
-  const [agentMessages, setAgentMessages] = useState<AgentChatMessage[]>([]);
-  const [agentActions, setAgentActions] = useState<AgentAction[]>([]);
-  const [lastAgentAction, setLastAgentAction] = useState<string | null>(null);
-  const [lastAgentActionResult, setLastAgentActionResult] = useState<string | null>(null);
-  const [chatting, setChatting] = useState(false);
   const [activeTab, setActiveTab] = useState<TabKey>("all");
   const [filterSeverity, setFilterSeverity] = useState("");
   const [filterVerdict, setFilterVerdict] = useState("");
@@ -186,10 +170,6 @@ export function ScanDetailView({
   const [projectWhitelistOpen, setProjectWhitelistOpen] = useState(false);
   /** 打开复测弹窗时记录本次是定向还是全量。 */
   const [retestMode, setRetestMode] = useState<"targeted" | "full" | null>(null);
-  const [taskNotice, setTaskNotice] = useState<string | null>(null);
-  const [taskItems, setTaskItems] = useState<AgentTaskItem[]>([]);
-  const [taskMode, setTaskMode] = useState<AgentTaskMode | null>(null);
-  const [highlightedFindingIds, setHighlightedFindingIds] = useState<Set<number>>(new Set());
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [reviewError, setReviewError] = useState<string | null>(null);
   const [projectLinkUrl, setProjectLinkUrl] = useState<string | null>(null);
@@ -304,7 +284,7 @@ export function ScanDetailView({
 
   const load = async () => {
     setLoadError(null);
-    const [s, f, st, ev, graph, chatHistory, chatActions, score] = await Promise.all([
+    const [s, f, st, ev, graph, score] = await Promise.all([
       api.getScan(scanId),
       api.getFindingsPage(scanId, {
         ...findingParams,
@@ -314,8 +294,6 @@ export function ScanDetailView({
       api.getStats(scanId),
       api.getEvents(scanId, 300),
       api.getCodeqlFlowGraph(scanId).catch(() => null),
-      api.getAgentChatHistory(scanId, 30).catch(() => []),
-      api.getAgentChatActions(scanId, 12).catch(() => []),
       api.getScanScore(scanId).catch(() => null),
     ]);
     setScan(s);
@@ -325,8 +303,6 @@ export function ScanDetailView({
     setScanScore(score);
     setEvents(ev);
     setCodeqlGraph(graph);
-    setAgentMessages(chatHistory);
-    setAgentActions(chatActions);
     await loadJournal();
     await loadProjectLink();
   };
@@ -1046,64 +1022,6 @@ export function ScanDetailView({
     }
   };
 
-  const handleChat = async (text: string) => {
-    setChatting(true);
-    try {
-      const result = await api.agentChat(scanId, { message: text, max_history: 16 });
-      setAgentMessages(result.messages || []);
-      setLastAgentAction(result.action || null);
-      setLastAgentActionResult(result.action_result || null);
-      if (result.action_history) {
-        setAgentActions(result.action_history);
-      }
-      if (result.action_result) {
-        setFpNotice(result.action_result);
-      }
-      await load();
-    } catch (e) {
-      setFpNotice(`Agent 对话失败: ${e}`);
-    } finally {
-      setChatting(false);
-    }
-  };
-
-  const handleRunTask = async (mode: AgentTaskMode) => {
-    setChatting(true);
-    setTaskNotice(null);
-    setTaskMode(mode);
-    try {
-      const result = await api.runAgentTask(scanId, {
-        mode,
-        scope: {
-          max_items: 12,
-          categories: tabToFindingCategories(activeTab),
-        },
-        options: { top_n: 12 },
-      });
-      const items = result.items || [];
-      setTaskItems(items);
-      setTaskNotice(result.summary || "任务已完成");
-      const ids = new Set(
-        items.map((item) => item.finding_id).filter((id): id is number => typeof id === "number"),
-      );
-      setHighlightedFindingIds(ids);
-    } catch (e) {
-      setTaskNotice(`任务执行失败: ${e}`);
-      setTaskItems([]);
-      setHighlightedFindingIds(new Set());
-    } finally {
-      setChatting(false);
-    }
-  };
-
-  const clearTaskResults = () => {
-    setTaskNotice(null);
-    setTaskItems([]);
-    setTaskMode(null);
-    setHighlightedFindingIds(new Set());
-  };
-
-  const highlightedCount = useMemo(() => highlightedFindingIds.size, [highlightedFindingIds]);
   const llmAuditSummary = useMemo(() => {
     const settings = llmJournal.find((e) => e.type === "settings_snapshot");
     const domains = llmJournal.find((e) => e.type === "domain_selection");
@@ -1530,6 +1448,8 @@ export function ScanDetailView({
             />
           )}
 
+          <DeepAuditPanel scanId={scan.id} onFindingsChanged={() => void load()} />
+
       {deleteError && (
         <div className="card p-3 text-sm text-red-300 border border-danger/40 bg-danger/10">
           删除失败: {deleteError}
@@ -1676,16 +1596,6 @@ export function ScanDetailView({
       </div>
 
       <div className="card overflow-hidden">
-        {highlightedCount > 0 && (
-          <div className="px-4 py-2 border-b border-cyan-500/20 bg-cyan-500/5 flex items-center justify-between gap-2 flex-wrap">
-            <p className="text-xs text-cyan-200/90">
-              Agent 已在列表中高亮 {highlightedCount} 条相关漏洞（青色左边框）
-            </p>
-            <button type="button" className="btn-ghost text-xs" onClick={clearTaskResults}>
-              清除高亮
-            </button>
-          </div>
-        )}
         <div className="px-4 py-2.5 border-b border-surface-border bg-black/20 flex items-center justify-between gap-3 flex-wrap">
           <p className="text-xs text-slate-400">
             {selectedFindingIds.size > 0 ? (
@@ -1862,7 +1772,6 @@ export function ScanDetailView({
           }}
           onReview={handleReview}
           reviewingId={reviewingId}
-          highlightedIds={highlightedFindingIds}
           selectedIds={selectedFindingIds}
           onToggleSelect={toggleSelectFinding}
           onToggleSelectPage={toggleSelectPage}
@@ -2239,25 +2148,9 @@ export function ScanDetailView({
       )}
         </div>
 
-        <AuditChatBar
-          disabled={isRunning || chatting}
-          onCommand={handleChat}
-          onRunTask={handleRunTask}
-          messages={agentMessages}
-          lastAction={lastAgentAction}
-          lastActionResult={lastAgentActionResult}
-          actions={agentActions}
-          taskNotice={taskNotice}
-          taskItems={taskItems}
-          taskMode={taskMode}
-          onOpenFinding={openFindingKeepingScroll}
-          onReviewFinding={handleReview}
-          reviewingId={reviewingId}
-          onClearTaskResults={clearTaskResults}
-        />
       </div>
 
-      <AgentPanel scan={scan} stats={stats} events={events} highlightedCount={highlightedCount} />
+      <AgentPanel scan={scan} stats={stats} events={events} />
 
       {exploitabilityModeOpen &&
         createPortal(

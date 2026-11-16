@@ -237,14 +237,24 @@ async def chat_completion(
     max_tokens: int = 4096,
     timeout: float | None = None,
     json_mode: bool = False,
+    usage_out: dict | None = None,
+    max_retries: int | None = None,
 ) -> str:
-    """Run a chat completion and return assistant text."""
+    """Run a chat completion and return assistant text.
+
+    ``usage_out`` optionally receives the provider's token usage. Legacy callers
+    never pass it, so their behaviour is unchanged; Deep Audit uses it to
+    enforce a real token budget instead of estimating every call.
+    """
     wait = timeout if timeout is not None else effective_llm_timeout(task=task)
     effective_model = resolve_model(task, explicit=model)
 
     client = _openai_client()
     if not client:
         raise RuntimeError(llm_not_configured_message())
+
+    if max_retries is not None:
+        client = client.with_options(max_retries=max_retries)
 
     create_kwargs: dict = {
         "model": effective_model,
@@ -285,7 +295,39 @@ async def chat_completion(
                 raise _timeout_error(te) from te
         else:
             raise
+    if usage_out is not None:
+        usage = getattr(response, "usage", None)
+        usage_out["prompt_tokens"] = int(getattr(usage, "prompt_tokens", 0) or 0)
+        usage_out["completion_tokens"] = int(getattr(usage, "completion_tokens", 0) or 0)
+        usage_out["total_tokens"] = int(getattr(usage, "total_tokens", 0) or 0)
     return (response.choices[0].message.content or "").strip()
+
+
+async def stream_chat_completion(
+    messages: list[dict], *, task: str, temperature: float, max_tokens: int, timeout: float
+):
+    client = _openai_client()
+    if client is None:
+        raise RuntimeError(llm_not_configured_message())
+
+    async with client.with_options(max_retries=0) as connection, asyncio.timeout(timeout):
+        stream = await connection.chat.completions.create(
+            model=resolve_model(task), messages=messages, temperature=temperature,
+            max_tokens=max_tokens, stream=True,
+        )
+        async with stream:
+            async for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+
+
+async def chat_completion_with_usage(
+    messages: list[dict], **kwargs
+) -> tuple[str, dict]:
+    """Return ``(text, usage)`` without changing the legacy contract."""
+    usage: dict = {}
+    text = await chat_completion(messages, usage_out=usage, **kwargs)
+    return text, usage
 
 
 def format_llm_exception(exc: BaseException) -> str:

@@ -1405,12 +1405,13 @@ async def start_scan_task(scan_id: int, *, source: str = "manual") -> None:
 
         deleted_sast = 0
         llm_left: int | None = None
-        # Replacing SAST results only — keep LLM endpoint findings / journals.
+        # Replace scanner results and retain evidence-backed Deep Audit findings.
         if scan.status in (ScanStatus.COMPLETED, ScanStatus.FAILED) or was_zombie:
             result = await session.execute(
                 delete(Finding).where(
                     Finding.scan_id == scan_id,
                     Finding.category == FindingCategory.SAST,
+                    Finding.tool != "deep_audit",
                 )
             )
             deleted_sast = int(result.rowcount or 0)
@@ -2580,6 +2581,13 @@ async def update_finding_review(
     finding = await session.get(Finding, finding_id)
     if not finding or finding.scan_id != scan_id:
         raise ValueError("Finding not found")
+
+    if finding.tool == "deep_audit" and review_status == ReviewStatus.CONFIRMED:
+        from app.services.blackboard_service import has_finding_evidence
+
+        if not await has_finding_evidence(session, finding):
+            raise ValueError("Deep Audit 候选缺少对应代码证据")
+        finding.ai_verdict = AiVerdict.REAL_VULN
 
     if review_status == ReviewStatus.FALSE_POSITIVE and not (review_note or "").strip():
         raise ValueError("标记误报必须填写原因")

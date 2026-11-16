@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+from collections.abc import Callable
 from pathlib import Path
 
 from sqlalchemy import select
@@ -12,7 +14,7 @@ from app.config import settings
 from app.models import Finding, ScanEvent, ScanTask, dt_iso
 from app.services.agent_tools import TOOL_SPECS, execute_agent_tool, parse_agent_response
 from app.services.endpoint_discovery_service import discover_controller_units, list_endpoints_summary
-from app.services.llm_provider import chat_completion, effective_llm_timeout, is_llm_configured, llm_not_configured_message
+from app.services.llm_provider import chat_completion, effective_llm_timeout, is_llm_configured, llm_not_configured_message, stream_chat_completion
 from app.services.scan_service import explain_llm_no_findings
 
 logger = logging.getLogger(__name__)
@@ -259,6 +261,30 @@ async def _build_scan_context(session: AsyncSession, scan_id: int) -> str:
     return json.dumps(context, ensure_ascii=False, indent=2)
 
 
+_ANSWER_PREFIX = re.compile(
+    r'^\s*(?:```(?:json)?\s*)?\{\s*"action"\s*:\s*"answer"\s*,\s*"content"\s*:\s*"'
+)
+_JSON_STRING_PART = re.compile(r'(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*')
+
+
+async def _stream_agent_round(messages, emit, **options) -> str:
+    raw = ""
+    shown = ""
+    async for delta in stream_chat_completion(messages, **options):
+        raw += delta
+        prefix = _ANSWER_PREFIX.match(raw)
+        if not prefix:
+            continue
+        encoded = _JSON_STRING_PART.match(raw, prefix.end()).group()
+        partial = json.loads(f'"{encoded}"')
+        if partial and 0xD800 <= ord(partial[-1]) <= 0xDBFF:
+            partial = partial[:-1]
+        if partial != shown:
+            shown = partial
+            emit("reply", shown)
+    return raw.strip()
+
+
 async def answer_scan_chat(
     session: AsyncSession,
     scan_id: int,
@@ -266,6 +292,7 @@ async def answer_scan_chat(
     *,
     max_history: int = 12,
     action_result: str | None = None,
+    emit: Callable[[str, str], None] | None = None,
 ) -> str:
     if _is_llm_diagnosis_question(user_message):
         try:
@@ -304,7 +331,8 @@ async def answer_scan_chat(
 
     for round_no in range(max_rounds):
         try:
-            last_text = await chat_completion(
+            complete = chat_completion if emit is None else lambda messages, **kw: _stream_agent_round(messages, emit, **kw)
+            last_text = await complete(
                 messages,
                 task="agent",
                 temperature=0.15,
@@ -312,7 +340,8 @@ async def answer_scan_chat(
                 timeout=effective_llm_timeout(4, task="agent"),
             )
         except Exception as exc:
-            fallback = f"对话 Agent 调用失败: {exc}"
+            logger.warning("Chat model failed: %s", type(exc).__name__)
+            fallback = "对话 Agent 调用失败，请检查模型连接后重试。"
             if action_result:
                 return f"{action_result}\n\n{fallback}"
             return fallback
@@ -328,6 +357,14 @@ async def answer_scan_chat(
         if parsed["action"] == "tool" and project_path.is_dir():
             tool_name = parsed.get("tool") or ""
             tool_args = parsed.get("arguments") or {}
+            if emit:
+                emit("progress", {
+                    "list_endpoints": "正在查看接口",
+                    "list_controllers": "正在查看控制器",
+                    "search_code": "正在搜索源码",
+                    "read_file": "正在读取源码",
+                    "read_files_batch": "正在读取相关文件",
+                }.get(tool_name, "正在处理工具请求"))
             tool_result = await asyncio.to_thread(
                 execute_agent_tool,
                 project_path,
@@ -335,7 +372,7 @@ async def answer_scan_chat(
                 tool_args,
                 scan_id=scan_id,
             )
-            logger.info("Agent tool round %s: %s %s", round_no + 1, tool_name, tool_args)
+            logger.info("Agent tool round %s completed", round_no + 1)
 
             messages.append({"role": "assistant", "content": last_text})
             messages.append(
