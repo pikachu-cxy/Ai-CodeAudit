@@ -32,6 +32,7 @@ import { LlmAuditJournalPanel } from "./LlmAuditJournalPanel";
 import { SkillAuditDialog, SkillAuditHistory } from "./AuditSkills";
 import { SastDeepProgressPanel, type SastDeepJob } from "./SastDeepProgressPanel";
 import { AgentPanel } from "./AgentPanel";
+import { AssetGraphPanel, type GraphDestination } from "./DeepAuditGraphs";
 import { DeepAuditPanel } from "./DeepAuditPanel";
 import { AuditReportHeader } from "./AuditReportHeader";
 import { ProjectSettingsModal } from "./ProjectSettingsModal";
@@ -118,6 +119,8 @@ export function ScanDetailView({
   const mainScrollRef = useRef<HTMLDivElement>(null);
   const savedScrollTop = useRef(0);
   const [scan, setScan] = useState<ScanSummary | null>(null);
+  const [graphTab, setGraphTab] = useState<"audit" | "asset">("audit");
+  const [graphTarget, setGraphTarget] = useState<GraphDestination>();
   const [project, setProject] = useState<ProjectSummary | null>(null);
   const [projectScans, setProjectScans] = useState<ScanSummary[]>([]);
   const [scanDiff, setScanDiff] = useState<ScanDiffSummary | null>(null);
@@ -1448,7 +1451,17 @@ export function ScanDetailView({
             />
           )}
 
-          <DeepAuditPanel scanId={scan.id} onFindingsChanged={() => void load()} />
+          <div className="space-y-3">
+            <div role="tablist" aria-label="扫描调查" className="flex gap-2">
+              <button role="tab" aria-selected={graphTab === "audit"} className={graphTab === "audit" ? "filter-chip filter-chip-active" : "filter-chip"} onClick={() => setGraphTab("audit")}>Deep Audit</button>
+              <button role="tab" aria-selected={graphTab === "asset"} className={graphTab === "asset" ? "filter-chip filter-chip-active" : "filter-chip"} onClick={() => setGraphTab("asset")}>资产图</button>
+            </div>
+            {graphTab === "audit"
+              ? <DeepAuditPanel key={scan.id} scanId={scan.id} destination={graphTarget} onFindingsChanged={() => void load()}
+                  onAsset={target => { setGraphTarget(target); setGraphTab("asset"); }} />
+              : <AssetGraphPanel key={scan.id} scanId={scan.id} destination={graphTarget}
+                  onTask={target => { setGraphTarget(target); setGraphTab("audit"); }} />}
+          </div>
 
       {deleteError && (
         <div className="card p-3 text-sm text-red-300 border border-danger/40 bg-danger/10">

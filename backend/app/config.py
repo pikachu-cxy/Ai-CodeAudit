@@ -78,6 +78,8 @@ class Settings(BaseSettings):
     deep_audit_max_batch_files: int = 6
     deep_audit_max_search_chars: int = 80
     deep_audit_max_tasks: int = 6
+    deep_audit_task_concurrency: int = 2
+    deep_audit_model_concurrency: int = 4
     # Audit behavior profile: stable | balanced | broad
     llm_audit_profile: str = "balanced"
     llm_audit_require_stronger_evidence: bool = False

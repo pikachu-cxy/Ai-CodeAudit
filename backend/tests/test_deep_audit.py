@@ -86,24 +86,24 @@ class DeepAuditTests(unittest.IsolatedAsyncioTestCase):
             row = (await conn.execute(text("SELECT id, slug, specialties FROM agent_definitions"))).one()
             self.assertEqual(tuple(row), (1, "existing-worker", None))
 
-    def test_role_budget_is_restored_and_shared_budget_still_applies(self):
-        policy = BudgetPolicy(max_llm_rounds=3)
+    async def test_role_budget_is_restored_and_shared_budget_still_applies(self):
+        policy = BudgetPolicy(max_llm_rounds=2)
         role = BudgetPolicy(max_llm_rounds=1)
         ledger = BudgetLedger(policy)
-        with ledger.for_role("worker:audit-authz", role):
-            ledger.check_llm()
-            ledger.llm_rounds += 1
-            snapshot = ledger.snapshot()
+        reservation, _ = await ledger.handle("worker:audit-authz", role).reserve_llm("prompt", lambda: None)
+        ledger.handle("worker:audit-authz", role).settle_llm(reservation, "prompt", "", {"prompt_tokens": 5}, 1)
+        restored = BudgetLedger.restore(policy, ledger.snapshot())
+        with self.assertRaises(RoleBudgetExceeded):
+            await restored.handle("worker:audit-authz", role).reserve_llm("prompt", lambda: None)
 
-        restored = BudgetLedger.restore(policy, snapshot)
-        with restored.for_role("worker:audit-authz", role), self.assertRaises(RoleBudgetExceeded):
-            restored.check_llm()
-        with restored.for_role("worker:audit-sql", policy):
-            restored.check_llm()
-            restored.llm_rounds += 2
-            with self.assertRaises(BudgetExceeded) as error:
-                restored.check_llm()
-            self.assertNotIsInstance(error.exception, RoleBudgetExceeded)
+        async def claim(key):
+            try:
+                await restored.handle(key, policy).reserve_llm("prompt", lambda: None)
+                return True
+            except BudgetExceeded:
+                return False
+        self.assertEqual(sorted(await asyncio.gather(claim("worker:b"), claim("worker:c"))), [False, True])
+        self.assertEqual(restored.llm_rounds, 2)
 
     async def _create_lineup(self):
         async with self.factory() as db:
@@ -122,13 +122,14 @@ class DeepAuditTests(unittest.IsolatedAsyncioTestCase):
             "focus": ["authz", "injection"], "max_tasks": 2,
         }
 
-    async def test_model_plan_changes_tasks_and_specialized_workers_run_serially(self):
+    async def test_model_plan_changes_tasks_and_specialized_workers_enter_same_batch(self):
         lineup = await self._create_lineup()
         path = f"/api/scans/{self.scan_ids['vuln']}/deep-audit/plan"
         baseline = (await self.client.post(path, json={"focus": lineup["focus"]})).json()
         calls = []
         usage = {"prompt_tokens": 120, "completion_tokens": 30}
         planner_calls = 0
+        both_entered = asyncio.Event()
 
         async def planner(messages, **kwargs):
             nonlocal planner_calls
@@ -155,6 +156,9 @@ class DeepAuditTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(instruction, str(messages))
             self.assertIn("Model checks", messages[0]["content"])
             if calls.count(model) == 1:
+                if len(set(calls)) == 2:
+                    both_entered.set()
+                await asyncio.wait_for(both_entered.wait(), timeout=3)
                 file_path = "app.py" if model == "auth-model" else "services.py"
                 return json.dumps({"action": "tool", "tool": "read_file", "arguments": {
                     "path": file_path, "start_line": 1, "end_line": 4,
@@ -174,7 +178,8 @@ class DeepAuditTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(run["run"]["status"], "completed", run["run"])
         self.assertEqual([t["agent_id"] for t in run["tasks"]], ["audit-authz", "audit-sql"])
-        self.assertEqual(calls, ["auth-model", "auth-model", "sql-model", "sql-model"])
+        self.assertEqual(set(calls[:2]), {"auth-model", "sql-model"})
+        self.assertTrue(both_entered.is_set())
         self.assertEqual(planner_calls, 2)
         self.assertEqual(run["budget_usage"]["llm_rounds"], 5)
         self.assertEqual(run["budget_usage"]["role_usage"]["planner:audit-planner"]["llm_rounds"], 1)
@@ -361,13 +366,174 @@ class DeepAuditTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(BudgetExceeded, "seconds"):
             restored.remaining_seconds()
 
+    async def test_batch_limits_cancel_and_resume_preserve_completed_tasks(self):
+        lineup = await self._create_lineup()
+        lineup.update(max_tasks=3)
+        peak = active = 0
+        visited: list[int] = []
+        completed = None
+
+        async def worker(db, *, run, task, cancel_check, **kwargs):
+            nonlocal peak, active, completed
+            visited.append(task.id)
+            active += 1
+            peak = max(peak, active)
+            try:
+                await asyncio.sleep(.04)
+                if completed is None:
+                    completed = task.id
+                elif len(visited) == 2:
+                    deep_audit_service.request_cancel(run.id)
+                    cancel_check()
+                return deep_audit_worker.WorkerOutcome(coverage="deterministic_verified")
+            finally:
+                active -= 1
+
+        with patch.object(settings, "deep_audit_task_concurrency", 1), patch.object(
+            deep_audit_service, "run_worker_task", side_effect=worker,
+        ):
+            run_id, result = await self._start("vuln", agent_slug=None, **lineup)
+            self.assertEqual(peak, 1)
+            self.assertEqual(result["run"]["status"], "cancelled")
+            self.assertEqual(len(visited), 2)
+            self.assertEqual(result["task_concurrency_limit"], 1)
+            self.assertEqual(result["active_tasks"], [])
+            response = await self.client.post(f"/api/deep-audit/runs/{run_id}/resume")
+            self.assertEqual(response.status_code, 200, response.text)
+            job = deep_audit_service._active_runs[run_id]
+            await asyncio.wait_for(asyncio.shield(job), 12)
+            finished = (await self.client.get(f"/api/deep-audit/runs/{run_id}")).json()
+            self.assertEqual(finished["run"]["status"], "completed")
+            self.assertEqual(visited.count(completed), 1)
+            self.assertEqual(peak, 1)
+
+    async def test_same_worker_is_not_scheduled_twice_and_concurrent_writes_dedupe(self):
+        lineup = await self._create_lineup()
+        lineup["max_tasks"] = 3
+        active = set()
+        seen = []
+        both = asyncio.Event()
+
+        async def planner(messages, **kwargs):
+            return json.dumps({"tasks": [
+                {"focus": "authz", "target": "app.py", "goal": "Owner", "priority": 90},
+                {"focus": "authz", "target": "services.py", "goal": "Roles", "priority": 80},
+                {"focus": "injection", "target": "app.py", "goal": "Input", "priority": 70},
+            ]}), {"prompt_tokens": 15, "completion_tokens": 10}
+
+        async def worker(db, *, run, task, ledger, cancel_check, repo, policy, visible_through, **kwargs):
+            self.assertNotIn(task.agent_id, active)
+            active.add(task.agent_id)
+            seen.append(task.agent_id)
+            try:
+                if len(active) == 2:
+                    both.set()
+                if len(seen) <= 2:
+                    await asyncio.wait_for(both.wait(), 3)
+                outcome = deep_audit_worker.WorkerOutcome(coverage="covered", visible_through=visible_through)
+                await deep_audit_worker._execute_tool(db, run=run, task=task, repo=repo, policy=policy,
+                    ledger=ledger, tool="read_file", arguments={"path": "app.py", "start_line": 1, "end_line": 4},
+                    agent_slug=task.agent_id, cancel_check=cancel_check, outcome=outcome)
+                for _ in range(2):
+                    await deep_audit_worker._submit_candidate(db, run=run, task=task,
+                        agent_slug=task.agent_id, ledger=ledger, cancel_check=cancel_check, outcome=outcome,
+                        candidate={"file": "app.py", "line_start": 2, "title": "Shared evidence"})
+                return outcome
+            finally:
+                active.remove(task.agent_id)
+
+        with patch.object(settings, "llm_api_key", "test-key"), patch.object(
+            deep_audit_model_planner, "chat_completion_with_usage", side_effect=planner,
+        ), patch.object(deep_audit_service, "run_worker_task", side_effect=worker):
+            run_id, summary = await self._start("vuln", agent_slug=None, **lineup)
+        self.assertEqual(summary["run"]["status"], "completed")
+        self.assertEqual(set(seen[:2]), {"audit-authz", "audit-sql"})
+        self.assertEqual(seen[2:], ["audit-authz"])
+        self.assertEqual(summary["fact_counts"]["code_fact"], 1)
+        self.assertEqual(summary["fact_counts"]["candidate_finding"], 2)  # one per focus
+        async with self.factory() as db:
+            self.assertEqual(await db.scalar(select(func.count()).select_from(Finding)), 2)
+        graph = (await self.client.get(f"/api/deep-audit/runs/{run_id}/audit-graph")).json()
+        self.assertTrue(any(edge["type"] == "references" for edge in graph["edges"]))
+
+    async def test_asset_snapshot_and_audit_graph_link_to_verified_source(self):
+        root = self.root / "vuln"
+        tiny = ('@RestController\nclass {cls} {{\n'
+                '  @PostMapping("/{route}")\n'
+                '  public String execute() {{ return "ok"; }}\n'
+                '}}\n')
+        for cls, route in (("Refund", "refund"), ("Alternate", "refund"), ("Account", "account")):
+            (root / f"{cls}.java").write_text(tiny.format(cls=cls, route=route))
+        lineup = await self._create_lineup()
+        api = f"/api/scans/{self.scan_ids['vuln']}/deep-audit"
+        first = (await self.client.post(api + "/asset-graph/build", json={})).json()
+        second = (await self.client.post(api + "/asset-graph/build", json={})).json()
+        self.assertEqual(first, second)
+        refunds = [n for n in first["nodes"] if n["type"] == "endpoint" and n["data"]["path"] == "/refund"]
+        self.assertEqual(len({n["id"] for n in refunds}), 2)
+        expect_asset = next(n["id"] for n in refunds if n["data"]["file"] == "Refund.java")
+
+        async def planner(messages, **kwargs):
+            return json.dumps({"tasks": [
+                {"focus": "authz", "target": "Refund.java:/refund", "goal": "Check refund", "priority": 80},
+                {"focus": "injection", "target": "Account.java:/account", "goal": "Check account", "priority": 70},
+            ]}), {"prompt_tokens": 30, "completion_tokens": 15}
+
+        auth_round = 0
+
+        async def worker(messages, **kwargs):
+            nonlocal auth_round
+            usage = {"prompt_tokens": 30, "completion_tokens": 15}
+            if kwargs["model"] == "sql-model":
+                return "invalid format", usage
+            auth_round += 1
+            if auth_round == 1:
+                return json.dumps({"action": "tool", "tool": "read_file", "arguments": {
+                    "path": "Refund.java", "start_line": 2, "end_line": 4,
+                }}), usage
+            return json.dumps({"action": "finish", "findings": [
+                {"file": "Refund.java", "line_start": 4, "title": "Missing ownership check"},
+            ]}), usage
+
+        with patch.object(settings, "llm_api_key", "test-key"), patch.object(
+            deep_audit_model_planner, "chat_completion_with_usage", side_effect=planner,
+        ), patch.object(deep_audit_worker, "chat_completion_with_usage", side_effect=worker):
+            rid, result = await self._start("vuln", agent_slug=None, **lineup)
+
+        self.assertEqual(result["run"]["status"], "failed")
+        self.assertEqual([t["coverage"] for t in result["tasks"]], ["covered", "invalid_output"])
+        run_api = f"/api/deep-audit/runs/{rid}"
+        source_graph = (await self.client.get(run_api + "/audit-graph")).json()
+        auth_task = next(n for n in source_graph["nodes"] if n["type"] == "task" and n["data"]["agent_id"] == "audit-authz")
+        self.assertEqual(auth_task["data"]["asset_ids"], [expect_asset])
+        self.assertEqual(source_graph["asset_graph_id"], first["asset_graph_id"])
+        layer = (await self.client.get(api + f"/asset-graph?run_id={rid}")).json()
+        self.assertEqual(first["nodes"], layer["nodes"])
+        self.assertEqual(layer["overlay"][expect_asset][0]["id"], auth_task["data"]["task_id"])
+        self.assertNotIn(next(n["id"] for n in refunds if n["id"] != expect_asset), layer["overlay"])
+        ev = next(n for n in source_graph["nodes"] if n["type"] == "evidence")
+        url = run_api + f"/evidence/{ev['data']['id']}/source"
+        response = await self.client.get(url)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("execute", response.json()["content"])
+        finding = next(n for n in source_graph["nodes"] if n["type"] == "finding")
+        response = await self.client.post(run_api + f"/findings/{finding['data']['finding_id']}/confirm", json={})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["review_status"].lower(), "confirmed")
+        (root / "Refund.java").write_text(tiny.format(cls="Refund", route="refund") + "\n// new revision")
+        third = (await self.client.post(api + "/asset-graph/build", json={})).json()
+        self.assertNotEqual(third["asset_graph_id"], first["asset_graph_id"])
+        historical = (await self.client.get(api + f"/asset-graph?run_id={rid}")).json()
+        self.assertEqual(historical["nodes"], first["nodes"])
+        self.assertEqual((await self.client.get(url)).status_code, 409)
+
     async def test_no_evidence_only_creates_a_hypothesis(self):
         async def attempt(db, *, run, task, **kwargs):
             outcome = deep_audit_worker.WorkerOutcome()
             await deep_audit_worker._submit_candidate(
                 db, run=run, task=task, agent_slug=run.agent_slug,
                 candidate={"file": "app.py", "line_start": 10, "title": "unsupported"},
-                outcome=outcome,
+                outcome=outcome, ledger=kwargs["ledger"], cancel_check=kwargs["cancel_check"],
             )
             return outcome
 

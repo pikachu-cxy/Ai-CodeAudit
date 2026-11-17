@@ -420,6 +420,21 @@ class AuditFactType(str, enum.Enum):
     CANDIDATE_FINDING = "candidate_finding" # evidence-backed candidate
 
 
+class AssetGraphSnapshot(Base):
+    """Immutable asset structure for an audit's scoped source revision."""
+
+    __tablename__ = "asset_graph_snapshots"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scan_id: Mapped[int] = mapped_column(ForeignKey("scan_tasks.id", ondelete="CASCADE"), index=True)
+    snapshot_key: Mapped[str] = mapped_column(String(64), unique=True)
+    repository_revision: Mapped[str] = mapped_column(String(128))
+    scope_json: Mapped[str] = mapped_column(Text)
+    extractor_version: Mapped[str] = mapped_column(String(32))
+    # MySQL TEXT is limited to 64 KiB. JSON stores the same structure on both backends.
+    graph: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class AuditRun(Base):
     """One Deep Audit execution for a scan. All writes go through blackboard_service."""
 

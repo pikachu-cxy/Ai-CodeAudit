@@ -124,6 +124,7 @@ class EndpointInfo:
     class_name: str = ""
     sensitivity: int = 0
     snippet: str = ""
+    handler_line: int | None = None
 
 
 @dataclass
@@ -258,6 +259,7 @@ def _discover_java_endpoints(project_path: Path, file_path: Path, *, read_source
         ep = EndpointInfo(
             file=rel,
             line=i + 1,
+            handler_line=j + 1,
             handler=handler,
             http_method=http_method,
             path=full_path or f"/{handler}",
@@ -315,6 +317,7 @@ def _discover_python_endpoints(project_path: Path, file_path: Path, *, read_sour
         ep = EndpointInfo(
             file=rel,
             line=i + 1,
+            handler_line=j + 1,
             handler=handler,
             http_method=method,
             path=path or f"/{handler}",
@@ -515,6 +518,7 @@ def _discover_nestjs_endpoints(
         ep = EndpointInfo(
             file=rel,
             line=i + 1,
+            handler_line=j + 1,
             handler=handler,
             http_method=method,
             path=full_path or f"/{handler}",
@@ -682,8 +686,9 @@ def list_endpoints_summary(
     cancel_check: Callable[[], None] | None = None,
     source_files: tuple[Path, ...] | None = None,
     read_source: Callable[[Path], str] | None = None,
+    include_handler_line: bool = False,
 ) -> list[dict]:
-    """Flat endpoint list for Agent tools."""
+    """Flat endpoint list for Agent tools and optionally handler locations for assets."""
     units = discover_controller_units(project_path, cancel_check=cancel_check, source_files=source_files, read_source=read_source)
     rows: list[dict] = []
     needle = (filter_text or "").strip().lower()
@@ -704,6 +709,7 @@ def list_endpoints_summary(
                     "path": ep.path,
                     "class": unit.class_name,
                     "sensitivity": ep.sensitivity,
+                    **({"handler_line": ep.handler_line} if include_handler_line else {}),
                 }
             )
 

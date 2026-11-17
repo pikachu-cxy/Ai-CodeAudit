@@ -162,9 +162,9 @@ async def capabilities() -> dict:
     """Real runtime facts — never a fabricated model catalogue."""
     llm_on = is_llm_configured()
     return {
-        "runtime_status": "deep_audit_v1_serial_roles",
+        "runtime_status": "deep_audit_v1_batched_workers",
         "execution_wired": True,
-        "scheduler": "1 Planner → 1–3 Workers（串行）",
+        "scheduler": "1 Planner → 1–3 Workers（同批最多两个）",
         "blackboard": "audit_runs / audit_tasks / audit_facts / audit_evidence",
         "llm_configured": llm_on,
         "roles": list(AGENT_ROLES),
@@ -181,7 +181,7 @@ async def capabilities() -> dict:
             "mode": "deep_audit_v1",
             "worker_count": 1,
             "max_workers": 3,
-            "parallel_workers": False,
+            "parallel_workers": settings.deep_audit_task_concurrency >= 2,
             "worker_mode": "llm" if llm_on else "deterministic_fallback",
             "allowed_tools": sorted(ALLOWED_TOOLS),
             "mcp_tools_granted": False,
@@ -191,7 +191,7 @@ async def capabilities() -> dict:
             "legacy_llm_audit_preserved": True,
         },
         "note": (
-            "Deep Audit V1 可选择已启用的 Planner 和 1–3 个 Worker，按擅长方向串行分配任务。"
+            "Deep Audit V1 可选择已启用的 Planner 和 1–3 个 Worker，按擅长方向分配任务，每批最多两个不同 Worker 同时执行。"
             "MCP / Skill 未授予执行权限。"
             "候选 Finding 必须带代码证据且保持 UNREVIEWED/PENDING，只有人工复核才能确认。"
             "effective_model 来自现有 LLM 设置解析，此端点不做任何模型调用。"

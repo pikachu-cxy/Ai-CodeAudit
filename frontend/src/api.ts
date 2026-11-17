@@ -1307,7 +1307,29 @@ export interface DeepAuditConfirmedFinding {
   message: string;
 }
 
+export interface AuditGraphNode {
+  id: string;
+  type: string;
+  label: string;
+  data: Record<string, unknown>;
+}
+
+export interface AuditGraph {
+  nodes: AuditGraphNode[];
+  edges: { id: string; source: string; target: string; type: string; verified: boolean }[];
+  asset_graph_id?: number;
+  scan_id: number;
+  repository_revision: string;
+  truncated?: boolean;
+  run_id?: number;
+  active_tasks?: number[];
+  task_concurrency_limit?: number;
+  overlay?: Record<string, { id: number; status: string; coverage: string; label: string; agent_id: string }[]>;
+}
+
 export interface DeepAuditSummary {
+  active_tasks: { id: number; agent_id: string; status: string; task_type: string }[];
+  task_concurrency_limit: number;
   run: {
     id: number;
     scan_id: number;
@@ -2060,6 +2082,16 @@ export const api = {
     }),
   deepAuditRuns: (scanId: number) =>
     request<{ runs: DeepAuditRun[] }>(`/scans/${scanId}/deep-audit/runs`),
+  assetGraph: (scanId: number, runId?: number, root?: string) =>
+    request<AuditGraph>(`/scans/${scanId}/deep-audit/asset-graph?${new URLSearchParams({
+      ...(runId ? { run_id: String(runId) } : {}), ...(root ? { root_asset_id: root } : {}),
+    })}`),
+  buildAssetGraph: (scanId: number) =>
+    request<AuditGraph>(`/scans/${scanId}/deep-audit/asset-graph/build`, { method: "POST", body: JSON.stringify({}) }),
+  auditGraph: (runId: number) => request<AuditGraph>(`/deep-audit/runs/${runId}/audit-graph`),
+  auditEvidenceSource: (runId: number, id: number) =>
+    request<{ file_path: string; line_start: number; line_end: number; content: string }>(
+      `/deep-audit/runs/${runId}/evidence/${id}/source`),
   deepAuditSummary: (runId: number) =>
     request<DeepAuditSummary>(`/deep-audit/runs/${runId}`),
   deepAuditFacts: (runId: number, factType?: string) =>

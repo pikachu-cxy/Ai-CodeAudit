@@ -57,6 +57,10 @@ class ToolPolicyError(ValueError):
     """Raised when an Agent asks for a tool/argument outside the read-only policy."""
 
 
+class RepositoryChanged(ToolPolicyError):
+    """An entry in the frozen inventory no longer matches its source."""
+
+
 def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
@@ -183,9 +187,12 @@ class ReadOnlyRepository:
         expected = self._hashes.get(path)
         if expected is None:
             raise ToolPolicyError("文件不在只读源码清单内")
-        data = self._read_bytes(path)
+        try:
+            data = self._read_bytes(path)
+        except (OSError, ToolPolicyError) as exc:
+            raise RepositoryChanged("运行期间源码版本已变化") from exc
         if hashlib.sha256(data).digest() != expected:
-            raise ToolPolicyError("运行期间源码版本已变化")
+            raise RepositoryChanged("运行期间源码版本已变化")
         return data.decode("utf-8", errors="replace")
 
     def read_slice(self, entry: dict, *, char_limit: int) -> CodeSlice:

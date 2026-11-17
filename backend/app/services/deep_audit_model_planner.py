@@ -1,16 +1,14 @@
 """Model planning with no tool access and server-owned task and scope fields."""
 from __future__ import annotations
 
-import asyncio
 import json
-import time
 from collections.abc import Awaitable, Callable, Collection
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.services.blackboard_service import compute_task_fingerprint
-from app.services.deep_audit_budget import BudgetLedger, BudgetPolicy, RoleBudgetExceeded, estimate_tokens
+from app.services.deep_audit_budget import BudgetExceeded, BudgetLedger, BudgetPolicy, RoleBudgetExceeded, estimate_tokens
 from app.services.deep_audit_lineup import RoleConfig
 from app.services.deep_audit_planner import FOCUS_LABELS, FOCUS_SPECS, PlannerInput, plan_tasks
 from app.services.llm_provider import chat_completion_with_usage, effective_llm_timeout
@@ -84,6 +82,9 @@ def _planning_context(data: PlannerInput, files: Collection[str], size: int) -> 
     targets = list(dict.fromkeys([
         "<repository>", *(path for path in clues if path in file_set), *list(files)[:size],
     ]))[:size + 1]
+    for endpoint in data.endpoints[:size]:
+        if endpoint.get('file') in file_set and endpoint.get('path'):
+            targets.append(f"{endpoint['file']}:{endpoint['path']}")
     return {
         "scope": data.scope.to_dict(),
         "project": data.project_info,
@@ -115,62 +116,41 @@ async def generate_plan(
         return fallback("llm_not_configured")
 
     role_policy = BudgetPolicy(**planner.policy)
-    with ledger.for_role(f"planner:{planner.slug}", role_policy):
-        messages = [{"role": "system", "content": PLANNER_PROMPT}]
-        if planner.system_prompt:
-            messages.append({"role": "system", "content": planner.system_prompt})
-        context = _planning_context(data, files, 1)
-        for size in (24, 12, 4):
-            proposed = _planning_context(data, files, size)
-            sample = messages + [{"role": "user", "content": json.dumps(proposed, ensure_ascii=False)}]
-            if estimate_tokens(json.dumps(sample, ensure_ascii=False)) + 512 < min(
-                role_policy.max_total_tokens, ledger.policy.max_total_tokens - ledger.total_tokens,
-            ):
-                context = proposed
-                break
-        messages.append({"role": "user", "content": json.dumps(context, ensure_ascii=False)})
-        prompt = json.dumps(messages, ensure_ascii=False)
-        if estimate_tokens(prompt) + 1 >= min(
-            role_policy.max_total_tokens, ledger.policy.max_total_tokens - ledger.total_tokens,
-        ):
-            return fallback("planner_prompt_exceeds_budget")
-        check()
-        try:
-            limit = ledger.completion_limit(prompt)
-        except RoleBudgetExceeded:
-            return fallback("planner_budget_exhausted")
-        ledger.llm_rounds += 1
-        if persist:
-            await persist()
-        timeout = min(ledger.remaining_seconds(), effective_llm_timeout(2, task=planner.model_task))
-        started = time.perf_counter()
-        error = None
-        text, usage = "", None
-        try:
-            text, usage = await asyncio.wait_for(chat_completion_with_usage(
-                messages, task=planner.model_task, model=planner.model_override,
-                temperature=0, max_tokens=limit, timeout=timeout, max_retries=0,
-            ), timeout=timeout)
-        except TimeoutError:
-            error = "planner_timeout"
-        except Exception:
-            error = "planner_provider_error"
-        ledger.consume_llm(
-            prompt_text=prompt, completion_text=text, usage=usage,
-            elapsed_ms=int((time.perf_counter() - started) * 1000),
+    budget = ledger.handle(f"planner:{planner.slug}", role_policy)
+    messages = [{"role": "system", "content": PLANNER_PROMPT}]
+    if planner.system_prompt:
+        messages.append({"role": "system", "content": planner.system_prompt})
+    context = _planning_context(data, files, 1)
+    available = min(role_policy.max_total_tokens, ledger.policy.max_total_tokens - ledger.total_tokens)
+    for size in (24, 12, 4):
+        proposed = _planning_context(data, files, size)
+        sample = messages + [{"role": "user", "content": json.dumps(proposed, ensure_ascii=False)}]
+        if estimate_tokens(json.dumps(sample, ensure_ascii=False)) + 512 < available:
+            context = proposed
+            break
+    messages.append({"role": "user", "content": json.dumps(context, ensure_ascii=False)})
+    if estimate_tokens(json.dumps(messages, ensure_ascii=False)) + 1 >= available:
+        return fallback("planner_prompt_exceeds_budget")
+    try:
+        text = await budget.call_model(
+            chat_completion_with_usage, messages, check=check, persist=persist,
+            task=planner.model_task, model=planner.model_override, temperature=0,
+            timeout=effective_llm_timeout(2, task=planner.model_task),
         )
-        if persist:
-            await persist()
+    except RoleBudgetExceeded:
+        return fallback("planner_budget_exhausted")
+    except BudgetExceeded:
+        raise
+    except TimeoutError:
         check()
         ledger.check_time()
-        try:
-            ledger.check_consumed_tokens()
-        except RoleBudgetExceeded:
-            return fallback("planner_budget_exhausted")
-        if error:
-            return fallback(error)
-        try:
-            specs = _validated_specs(text, data, context["targets"])
-        except ValueError as exc:
-            return fallback(str(exc))
+        return fallback("planner_timeout")
+    except Exception:
+        check()
+        return fallback("planner_provider_error")
+    check()
+    try:
+        specs = _validated_specs(text, data, context["targets"])
+    except ValueError as exc:
+        return fallback(str(exc))
     return specs, {"mode": "agent_llm", "fallback_reason": None}

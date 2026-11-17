@@ -292,6 +292,7 @@ async def add_fact(
     line_end: int | None = None,
     metadata: dict | None = None,
     cross_run_dedupe: bool = True,
+    commit: bool = True,
 ) -> tuple[AuditFact, bool]:
     """Write one fact immediately; return ``(fact, created)``.
 
@@ -342,6 +343,9 @@ async def add_fact(
         metadata_json=_dumps(metadata or {}),
     )
     db.add(row)
+    if not commit:
+        await db.flush()
+        return row, True
     try:
         await db.commit()
     except IntegrityError:
@@ -367,6 +371,7 @@ async def add_evidence(
     revision: str,
     evidence_type: str = "code_slice",
     summary_prefix: str = "读取到的代码范围",
+    commit: bool = True,
 ) -> list[AuditEvidence]:
     """Attach verifiable code evidence (revision + line range + content hash)."""
     created: list[AuditEvidence] = []
@@ -400,7 +405,7 @@ async def add_evidence(
         )
         db.add(row)
         created.append(row)
-    if created:
+    if created and commit:
         await db.commit()
     return created
 
@@ -470,6 +475,14 @@ def serialize_evidence(row: AuditEvidence) -> dict:
     }
 
 
+def track_task_fact(task: AuditTask, fact: AuditFact) -> None:
+    scope = _loads(task.scope_json, {})
+    refs = scope.setdefault("fact_refs", [])
+    if fact.id not in refs and len(refs) < 256:
+        refs.append(fact.id)
+        task.scope_json = _dumps(scope)
+
+
 async def shared_facts_digest(db: AsyncSession, run_id: int, limit: int = 12) -> str:
     """Compact blackboard snapshot injected into every Worker prompt."""
     rows = (
@@ -512,6 +525,8 @@ async def link_candidate_finding(
     run: AuditRun,
     fact: AuditFact,
     candidate: dict,
+    *,
+    commit: bool = True,
 ) -> Finding | None:
     """Link an evidence-backed candidate to the EXISTING Finding entity.
 
@@ -555,7 +570,8 @@ async def link_candidate_finding(
     )
     if existing is not None:
         fact.finding_id = existing.id
-        await db.commit()
+        if commit:
+            await db.commit()
         return existing
 
     metadata = {
@@ -592,7 +608,8 @@ async def link_candidate_finding(
         scan.total_findings = await db.scalar(
             select(func.count(Finding.id)).where(Finding.scan_id == scan_id)
         )
-    await db.commit()
+    if commit:
+        await db.commit()
     return finding
 
 
@@ -643,7 +660,8 @@ async def run_summary(db: AsyncSession, run_id: int) -> dict | None:
         return None
     tasks = await list_tasks(db, run_id)
     facts = await list_facts(db, run_id, limit=200)
-    running = next((t for t in tasks if t.status == AuditTaskStatus.RUNNING.value), None)
+    active = [t for t in tasks if t.status == AuditTaskStatus.RUNNING.value]
+    running = active[0] if active else None
     candidate_facts = [f for f in facts if f["fact_type"] == AuditFactType.CANDIDATE_FINDING.value]
     linked_ids = [f["finding_id"] for f in facts if f.get("finding_id")]
     confirmed: list[dict] = []
@@ -682,6 +700,9 @@ async def run_summary(db: AsyncSession, run_id: int) -> dict | None:
             "config_snapshot": config,
         },
         "current_agent": current_agent,
+        "active_tasks": [{"id": task.id, "agent_id": task.agent_id, "task_type": task.task_type,
+                          "goal": task.goal, "status": task.status} for task in active],
+        "task_concurrency_limit": config.get("task_concurrency_limit", 1),
         "current_task": (
             {"id": running.id, "task_type": running.task_type, "goal": running.goal,
              "status": running.status, "priority": running.priority}
@@ -692,6 +713,9 @@ async def run_summary(db: AsyncSession, run_id: int) -> dict | None:
                 "id": t.id, "agent_id": t.agent_id, "task_type": t.task_type,
                 "goal": t.goal, "status": t.status, "priority": t.priority,
                 "result_summary": t.result_summary,
+                "budget_usage": _loads(t.budget_usage, {}),
+                "coverage": _loads(t.budget_usage, {}).get("coverage", "legacy" if t.status == "completed" else "uncovered"),
+                "asset_ids": _loads(t.scope_json, {}).get("asset_ids", []),
                 "started_at": dt_iso(t.started_at), "finished_at": dt_iso(t.finished_at),
             }
             for t in tasks

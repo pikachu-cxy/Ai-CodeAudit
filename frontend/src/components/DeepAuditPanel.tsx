@@ -23,6 +23,7 @@ import {
   type DeepAuditSummary,
 } from "../api";
 import { formatDateTime } from "../shared/format";
+import { AuditGraphPanel, type GraphDestination } from "./DeepAuditGraphs";
 import { useAsyncData } from "../shared/hooks/useAsyncData";
 import { KeyValueRow, MonoMeta, SectionCard, StatusPill } from "../shared/ui";
 import { InlineMessage } from "../shared/ui/forms";
@@ -262,7 +263,7 @@ export function DeepAuditLauncher({
         </button>
         {caps.data && (
           <MonoMeta>
-            Worker ×{lineup?.worker_slugs?.length ?? 1}（串行） · {caps.data.worker_mode} · 只读工具 {caps.data.allowed_tools.length} 个
+            Worker ×{lineup?.worker_slugs?.length ?? 1}（分批，每批最多两个） · {caps.data.worker_mode} · 只读工具 {caps.data.allowed_tools.length} 个
           </MonoMeta>
         )}
       </div>
@@ -324,13 +325,18 @@ export function DeepAuditLauncher({
 export function DeepAuditPanel({
   scanId,
   onFindingsChanged,
+  destination,
+  onAsset,
 }: {
   scanId: number;
   onFindingsChanged?: () => void;
+  destination?: GraphDestination;
+  onAsset?: (target: GraphDestination) => void;
 }) {
   const [open, setOpen] = useState(true);
   const [poll, setPoll] = useState(0);
-  const [selectedRunId, setSelectedRunId] = useState<number | null>(null);
+  const [selectedRunId, setSelectedRunId] = useState<number | null>(destination?.runId ?? null);
+  const [tab, setTab] = useState<"details" | "graph">(destination?.taskId ? "graph" : "details");
   const [factFilter, setFactFilter] = useState("");
   const [reviewNote, setReviewNote] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
@@ -342,11 +348,12 @@ export function DeepAuditPanel({
   );
 
   useEffect(() => {
-    const list = runs.data?.runs ?? [];
+    if (!runs.data || !open) return;
+    const list = runs.data.runs;
     setSelectedRunId((current) =>
       current && list.some((row) => row.id === current) ? current : (list[0]?.id ?? null),
     );
-  }, [runs.data]);
+  }, [runs.data, open]);
 
   const runList = runs.data?.runs ?? [];
   const selectedRun = runList.find((row) => row.id === selectedRunId);
@@ -381,7 +388,7 @@ export function DeepAuditPanel({
   const budget = data?.budget_usage ?? {};
   const confirmedIds = new Set((data?.confirmed_findings ?? []).map((item) => item.id));
   const completedTasks = (data?.tasks ?? []).filter((task) =>
-    ["completed", "skipped", "failed"].includes(task.status),
+    ["completed", "skipped"].includes(task.status),
   );
 
   const reload = () => setPoll((value) => value + 1);
@@ -428,7 +435,7 @@ export function DeepAuditPanel({
   return (
     <SectionCard
       title="Deep Audit V1 · 代码事实黑板（可选执行模式）"
-      description="Planner → 1 个只读 Worker → 共享事实 / 代码证据 → 现有 Finding。原有 SAST / LLM 审计链路保持不变。"
+      description="Planner → 每批最多两个不同的只读 Worker → 共享事实 / 代码证据 → 现有 Finding。原有 SAST / LLM 审计链路保持不变。"
       actions={
         <div className="flex items-center gap-2">
           <button type="button" className="btn-action" onClick={reload} disabled={!open}>
@@ -477,8 +484,15 @@ export function DeepAuditPanel({
             </InlineMessage>
           ) : (
             <>
+              <div role="tablist" aria-label="运行详情" className="flex gap-2">
+                <button role="tab" aria-selected={tab === "details"} className={tab === "details" ? "filter-chip filter-chip-active" : "filter-chip"} onClick={() => setTab("details")}>任务与黑板</button>
+                <button role="tab" aria-selected={tab === "graph"} className={tab === "graph" ? "filter-chip filter-chip-active" : "filter-chip"} onClick={() => setTab("graph")}>审计图</button>
+              </div>
+              {tab === "graph" && <AuditGraphPanel key={selectedRunId} runId={selectedRunId} poll={poll}
+                destination={destination?.runId === selectedRunId ? destination : undefined} onAsset={onAsset} />}
+              <div hidden={tab !== "details"} className="space-y-4">
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-                <Stat label="当前 Agent" value={data?.current_agent || "—"} icon={Bot} />
+                <Stat label={`运行中 Worker ${data?.active_tasks.length ?? 0} / ${data?.task_concurrency_limit ?? 1}`} value={data?.active_tasks.map(task => task.agent_id).join("、") || data?.current_agent || "—"} icon={Bot} />
                 <Stat
                   label="执行状态"
                   value={data?.run.status || "—"}
@@ -732,6 +746,7 @@ export function DeepAuditPanel({
                   </div>
                 )}
               </PanelBlock>
+              </div>
             </>
           )}
         </div>

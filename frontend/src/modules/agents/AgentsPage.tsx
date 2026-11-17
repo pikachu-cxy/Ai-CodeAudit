@@ -207,7 +207,7 @@ export function AgentsPage(ctx: PageContext) {
             <KeyValueRow label="可用模型绑定"><MonoMeta>{capabilities.model_tasks.join(" / ")}</MonoMeta></KeyValueRow>
             <KeyValueRow label="Worker 数量 / 模式">
               <MonoMeta>
-                1–{capabilities.deep_audit?.max_workers ?? 3} 个串行 Worker / {capabilities.deep_audit?.worker_mode ?? "—"}
+                1–{capabilities.deep_audit?.max_workers ?? 3} 个 Worker（每批最多两个） / {capabilities.deep_audit?.worker_mode ?? "—"}
               </MonoMeta>
             </KeyValueRow>
             <KeyValueRow label="MCP / Skill 授权">
@@ -251,7 +251,7 @@ export function AgentsPage(ctx: PageContext) {
             </select>
           </Field>
           <fieldset className="space-y-2">
-            <legend className="text-xs font-medium text-[var(--text-secondary)]">Worker（最多三个，串行）</legend>
+            <legend className="text-xs font-medium text-[var(--text-secondary)]">Worker（最多选三个，同批最多执行两个）</legend>
             {workers.map((row) => (
               <label key={row.id} className="flex items-center gap-2 text-xs">
                 <input type="checkbox" checked={chosenWorkers.includes(row.slug)}

@@ -19,6 +19,7 @@ Routes::
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Annotated, Any
 
@@ -27,12 +28,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database import get_db
 from app.dependencies.auth import require_admin, require_auth
 from app.models import AuditRun, ScanEvent, ScanTask, dt_iso
+from app.services import asset_graph_service as assets, audit_graph_service as audit_graph
 from app.services import blackboard_service as bb
 from app.services import deep_audit_service as svc
-from app.services.deep_audit_budget import BudgetExceeded, BudgetPolicy, DeepAuditBudgetSettings, save_deep_audit_budget
+from app.services.deep_audit_budget import BudgetExceeded, BudgetLedger, BudgetPolicy, DeepAuditBudgetSettings, save_deep_audit_budget
 from app.services.deep_audit_guards import ALLOWED_TOOLS, ToolPolicyError, relative_path
 from app.services.deep_audit_lineup import public_config
 from app.services.deep_audit_planner import FOCUS_KEYS, FOCUS_LABELS, AuditScope
@@ -132,11 +135,12 @@ async def deep_audit_capabilities(db: AsyncSession = Depends(get_db)) -> dict:
     return {
         "mode": "deep_audit_v1",
         "execution_wired": True,
-        "runtime_status": "deep_audit_v1_serial_roles",
+        "runtime_status": "deep_audit_v1_batched_workers",
         "planner": "agent_llm / deterministic_v1",
         "worker_count": 1,
         "max_workers": 3,
-        "parallel_workers": False,
+        "parallel_workers": settings.deep_audit_task_concurrency >= 2,
+        "task_concurrency_limit": min(2, max(1, settings.deep_audit_task_concurrency)),
         "blackboard": ["audit_runs", "audit_tasks", "audit_facts", "audit_evidence"],
         "allowed_tools": sorted(ALLOWED_TOOLS),
         "mcp_tools_granted": False,
@@ -149,7 +153,7 @@ async def deep_audit_capabilities(db: AsyncSession = Depends(get_db)) -> dict:
         "policy": policy.to_dict(),
         "legacy_llm_audit_preserved": True,
         "note": (
-"Deep Audit V1 由 Planner 生成结构化任务，1–3 个 Worker 串行执行，仅能调用 "
+"Deep Audit V1 由 Planner 生成结构化任务，1–3 个 Worker 按批执行，同批最多两个不同 Worker，仅能调用 "
             "5 个只读代码工具。无代码证据不会创建 Finding；候选 Finding 均为 UNREVIEWED/PENDING，"
             "必须人工确认。MCP / Skill 未授予执行权限。原有扫描器与 LLM 深度审计链路保持不变。"
         ),
@@ -228,8 +232,85 @@ async def run_summary(run_id: int, db: AsyncSession = Depends(get_db)) -> dict:
     if summary is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "运行摘要不可用")
     summary["run"] = {**summary["run"], "is_active": svc.is_active(run_id)}
+    if not svc.is_active(run_id):
+        summary["active_tasks"] = []
+        summary["current_task"] = None
     summary["scan_id"] = run.scan_id
     return summary
+
+
+@router.post("/scans/{scan_id}/deep-audit/asset-graph/build")
+async def build_asset_graph(scan_id: int, body: DeepAuditScopeIn, db: AsyncSession = Depends(get_db)):
+    scan = await db.get(ScanTask, scan_id)
+    if scan is None:
+        raise HTTPException(404, "扫描不存在")
+    try:
+        scope = _clean_scope(body)
+        ledger = BudgetLedger(await BudgetPolicy.for_new_run(db))
+        repo = await svc._repository(scan, scope, ledger)
+        snapshot = await assets.ensure_snapshot(db, scan, repo, scope.path_prefixes, ledger)
+        return await assets.project_snapshot(db, snapshot)
+    except (ValueError, OSError, BudgetExceeded, TimeoutError) as exc:
+        raise HTTPException(400, "无法从当前扫描源码生成资产图") from exc
+
+
+@router.get("/scans/{scan_id}/deep-audit/asset-graph")
+async def get_asset_graph(
+    scan_id: int, run_id: int | None = Query(default=None, ge=1),
+    root_asset_id: str | None = Query(default=None, max_length=64),
+    db: AsyncSession = Depends(get_db),
+):
+    run = await _require_run(db, run_id) if run_id else None
+    snapshot_id = None
+    if run:
+        snapshot_id = _loads(run.config_snapshot, {}).get("asset_graph_id")
+        if run.scan_id != scan_id or not snapshot_id:
+            raise HTTPException(404, "该运行没有对应资产图快照")
+    snapshot = await assets.read_snapshot(db, scan_id, snapshot_id)
+    if not snapshot or (run and run.repository_revision != snapshot.repository_revision):
+        raise HTTPException(404, "资产图快照不存在")
+    if root_asset_id and not any(node["id"] == root_asset_id for node in snapshot.graph["nodes"]):
+        raise HTTPException(404, "资产不存在于该快照")
+    return await assets.project_snapshot(db, snapshot, run, root_asset_id, active=bool(run and svc.is_active(run.id)))
+
+
+@router.get("/deep-audit/runs/{run_id}/audit-graph")
+async def get_audit_graph(run_id: int, db: AsyncSession = Depends(get_db)):
+    run = await _require_run(db, run_id)
+    return await audit_graph.project_run(db, run, active=svc.is_active(run_id))
+
+
+@router.get("/deep-audit/runs/{run_id}/evidence/{evidence_id}/source")
+async def evidence_source(run_id: int, evidence_id: int, db: AsyncSession = Depends(get_db)):
+    run = await _require_run(db, run_id)
+    graph = await audit_graph.project_run(db, run, active=svc.is_active(run_id))
+    evidence = next((n["data"] for n in graph["nodes"] if n["id"] == f"evidence:{evidence_id}"), None)
+    if not evidence or evidence["evidence_type"] != "code_slice":
+        raise HTTPException(404, "此证据没有可定位的源码")
+    scan = await db.get(ScanTask, run.scan_id)
+    if scan is None:
+        raise HTTPException(404, "扫描不存在")
+    revision = run.repository_revision
+    prefixes = tuple(_loads(run.scope_json, {}).get("path_prefixes", []))
+    policy = BudgetPolicy(**_loads(run.config_snapshot, {}).get("policy", {}))
+    await db.commit()
+    try:
+        ledger = BudgetLedger(policy)
+        repo = await svc._repository(scan, AuditScope(path_prefixes=prefixes), ledger)
+        if repo.revision != revision:
+            raise ToolPolicyError("扫描源码版本已变化")
+        snippet = await asyncio.wait_for(asyncio.to_thread(
+            repo.read_slice,
+            {"path": relative_path(evidence["file_path"]),
+             "start_line": evidence["line_start"], "end_line": evidence["line_end"]},
+            char_limit=policy.max_output_chars,
+        ), timeout=ledger.remaining_seconds())
+        if snippet.content_hash != evidence["content_hash"] or snippet.line_end != evidence["line_end"]:
+            raise ToolPolicyError("证据内容校验失败")
+    except (OSError, ValueError, BudgetExceeded, TimeoutError) as exc:
+        raise HTTPException(409, "历史源码已删除、版本不符或不可读取，无法定位这条证据") from exc
+    return {"file_path": snippet.path, "line_start": snippet.line_start,
+            "line_end": snippet.line_end, "content": snippet.content}
 
 
 @router.get("/deep-audit/runs/{run_id}/facts")

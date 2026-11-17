@@ -11,24 +11,24 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.services import asset_graph_service as assets
 from app.database import async_session
 from app.models import (
-    AgentDefinition, AuditRun, AuditRunStatus, AuditTask, AuditTaskStatus,
+    AgentDefinition, AuditFact, AuditRun, AuditRunStatus, AuditTask, AuditTaskStatus,
     Finding, ScanTask, ScanStatus,
 )
 from app.services import blackboard_service as bb
 from app.services.deep_audit_budget import (
     BudgetExceeded, BudgetLedger, BudgetPolicy, RoleBudgetExceeded,
 )
-from app.services.deep_audit_guards import ReadOnlyRepository, ToolPolicyError, relative_path
+from app.services.deep_audit_guards import ReadOnlyRepository, RepositoryChanged, ToolPolicyError, relative_path
 from app.services.deep_audit_lineup import RoleConfig, assign_workers, builtin_worker, freeze_role, resolve_lineup
 from app.services.deep_audit_model_planner import generate_plan
 from app.services.deep_audit_planner import AuditScope, PlannerInput
@@ -148,8 +148,6 @@ async def _sast_context(db: AsyncSession, scan_id: int) -> list[dict]:
 
 
 async def _previous_context(db: AsyncSession, scan_id: int, current_run_id: int, revision: str) -> tuple[list[dict], set[str]]:
-    from app.models import AuditFact
-
     fact_rows = (
         await db.execute(
             select(AuditFact)
@@ -165,7 +163,7 @@ async def _previous_context(db: AsyncSession, scan_id: int, current_run_id: int,
     ]
     task_rows = (
         await db.execute(
-            select(AuditTask.fingerprint)
+            select(AuditTask.fingerprint, AuditTask.budget_usage)
             .join(AuditRun, AuditTask.run_id == AuditRun.id)
             .where(
                 AuditRun.scan_id == scan_id,
@@ -174,8 +172,9 @@ async def _previous_context(db: AsyncSession, scan_id: int, current_run_id: int,
                 AuditTask.status == AuditTaskStatus.COMPLETED.value,
             )
         )
-    ).scalars().all()
-    return facts, set(str(fp) for fp in task_rows)
+    ).all()
+    return facts, {fp for fp, usage in task_rows
+                   if _loads(usage, {}).get('coverage') in ('covered', 'deterministic_verified')}
 
 
 async def start_deep_audit(db: AsyncSession, options: DeepAuditStartOptions) -> AuditRun:
@@ -196,15 +195,18 @@ async def start_deep_audit(db: AsyncSession, options: DeepAuditStartOptions) -> 
         max_tasks=options.max_tasks or policy.max_tasks,
     ).normalised(policy.max_tasks)
     ledger = BudgetLedger(policy)
+    await db.commit()
     try:
         repo = await _repository(scan, scope, ledger)
     except (TimeoutError, BudgetExceeded) as exc:
         raise ToolPolicyError("建立只读源码清单超时") from exc
+    concurrency = min(len(workers), max(1, min(2, settings.deep_audit_task_concurrency)))
     config_snapshot = {
         "mode": "deep_audit_v1",
         "planner": "agent_llm" if planner else "deterministic_v1",
         "worker_count": len(workers),
-        "parallel_workers": False,
+        "parallel_workers": concurrency == 2,
+        "task_concurrency_limit": concurrency,
         "lineup": {"planner": asdict(planner) if planner else None, "workers": [asdict(worker) for worker in workers]},
         "worker_mode": "llm" if use_llm else "deterministic_fallback",
         "llm_configured": use_llm,
@@ -220,6 +222,11 @@ async def start_deep_audit(db: AsyncSession, options: DeepAuditStartOptions) -> 
             select(AuditRun.id).where(AuditRun.id.in_(active_ids), AuditRun.scan_id == scan.id).limit(1)
         ):
             raise ValueError("该扫描已有 Deep Audit 运行正在执行中")
+        try:
+            graph = await assets.ensure_snapshot(db, scan, repo, scope.path_prefixes, ledger)
+        except (TimeoutError, BudgetExceeded) as exc:
+            raise ToolPolicyError("建立资产图超时") from exc
+        config_snapshot["asset_graph_id"] = graph.id
         run = await bb.create_run(
             db, options.scan_id,
             config_snapshot=config_snapshot,
@@ -310,6 +317,7 @@ async def _execute_run_inner(run_id: int, *, use_llm: bool = False, repo: ReadOn
         check = lambda: check_cancel(run_id)
         check()
         if repo is None:
+            await db.commit()
             repo = await _repository(scan, scope, ledger, check)
         if repo.revision != run.repository_revision:
             raise ToolPolicyError("扫描源码版本已变化，请启动新的 Deep Audit 运行")
@@ -324,7 +332,8 @@ async def _execute_run_inner(run_id: int, *, use_llm: bool = False, repo: ReadOn
         tasks = await bb.list_tasks(db, run_id)
         if not tasks:
             sast_findings = await _sast_context(db, run.scan_id)
-            endpoints = await _endpoints(repo, ledger, check)
+            graph = await assets.read_snapshot(db, run.scan_id, config.get('asset_graph_id')) if config.get('asset_graph_id') else None
+            endpoints = assets.endpoint_context(graph) if graph else await _endpoints(repo, ledger, check)
             previous_facts, previous_fingerprints = await _previous_context(
                 db, run.scan_id, run_id, repo.revision,
             )
@@ -347,11 +356,14 @@ async def _execute_run_inner(run_id: int, *, use_llm: bool = False, repo: ReadOn
             async def persist_planner_usage() -> None:
                 await bb.update_run(db, run, budget_usage=ledger.snapshot())
 
+            await db.commit()
             specs, planning = await generate_plan(
                 planner_input, _relative_files(repo), ledger, planner, use_llm, check, persist_planner_usage,
             )
             check()
             specs = assign_workers(specs, list(workers.values()), run.agent_slug)
+            if graph:
+                assets.bind_tasks(graph, specs)
             tasks = await bb.upsert_tasks(db, run, specs, config_snapshot={**config, "planner_result": planning})
             await log_event(
                 db, run.scan_id, "planner_finished",
@@ -361,79 +373,60 @@ async def _execute_run_inner(run_id: int, *, use_llm: bool = False, repo: ReadOn
             )
         await bb.update_run(db, run, status=AuditRunStatus.RUNNING.value)
 
-        exhausted: str | None = None
-        cancelled = False
-        failure: str | None = None
-        role_failures: set[str] = set()
-        for task in tasks:
-            if task.status in (AuditTaskStatus.SKIPPED.value, AuditTaskStatus.COMPLETED.value):
-                continue
-            if exhausted or cancelled or failure:
+        concurrency = min(2, max(1, int(config.get("task_concurrency_limit", 1))))
+        remaining = [(task.id, task.agent_id) for task in tasks
+                     if task.status not in (AuditTaskStatus.SKIPPED.value, AuditTaskStatus.COMPLETED.value)]
+        role_failures = False
+        source_changed = False
+        first_batch = True
+        while remaining and run_id not in _cancel_requested and not ledger.exhausted_dimension:
+            ledger.check_time()
+            if not first_batch:
+                await db.commit()
+                current = await _repository(scan, scope, ledger, check)
+                if current.revision != run.repository_revision:
+                    source_changed = True
+                    break
+            first_batch = False
+            batch = []
+            selected = set()
+            for item in tuple(remaining):
+                if item[1] not in selected:
+                    batch.append(item)
+                    selected.add(item[1])
+                    remaining.remove(item)
+                if len(batch) == concurrency:
+                    break
+            digest = await bb.shared_facts_digest(db, run_id)
+            cutoff = await db.scalar(select(func.max(AuditFact.id)).where(AuditFact.run_id == run_id)) or 0
+            await db.commit()
+            if run_id in _cancel_requested:
                 break
-            try:
-                check_cancel(run_id)
-            except DeepAuditCancelled:
-                cancelled = True
+            stop_batch = asyncio.Event()
+            async with asyncio.TaskGroup() as group:
+                jobs = [group.create_task(execute_audit_task(
+                    run_id, task_id, repo, ledger,
+                    workers.get(agent_id) or legacy_agent, use_llm, digest, cutoff, stop_batch,
+                )) for task_id, agent_id in batch]
+            results = [job.result() for job in jobs]
+            role_failures |= "failed" in results
+            source_changed |= "source_changed" in results
+            if source_changed:
                 break
-            await bb.update_task(db, task, status=AuditTaskStatus.RUNNING.value)
-            try:
-                worker = workers.get(task.agent_id)
-                worker_policy = BudgetPolicy(**worker.policy) if worker else policy
-                role_budget = ledger.for_role(f"worker:{worker.slug}", worker_policy) if worker else nullcontext()
-                with role_budget:
-                    outcome = await run_worker_task(
-                        db, run=run, task=task, repo=repo, policy=worker_policy,
-                        ledger=ledger, agent=worker or legacy_agent,
-                        cancel_check=check, use_llm=use_llm,
-                    )
-                await bb.update_task(
-                    db, task,
-                    status=AuditTaskStatus.COMPLETED.value,
-                    result_summary=outcome.summary(),
-                    budget_usage=ledger.snapshot(),
-                )
-            except RoleBudgetExceeded as exc:
-                role_failures.add(task.agent_id)
-                await bb.update_task(
-                    db, task, status=AuditTaskStatus.FAILED.value,
-                    result_summary=f"Worker 预算耗尽（{exc.dimension}），已完成事实已保存",
-                )
-            except BudgetExceeded as exc:
-                exhausted = exc.dimension
-                await bb.update_task(
-                    db, task, status=AuditTaskStatus.FAILED.value,
-                    result_summary=f"预算耗尽（{exc.dimension}），已完成事实已保存",
-                )
-                ledger.exhausted_dimension = exc.dimension
-            except DeepAuditCancelled:
-                cancelled = True
-                await bb.update_task(
-                    db, task, status=AuditTaskStatus.PENDING.value,
-                    result_summary="已取消；已保存事实与证据保留，可恢复运行",
-                )
-            except (ToolPolicyError, OSError, ValueError) as exc:
-                failure = str(exc) if isinstance(exc, ToolPolicyError) else f"任务异常：{type(exc).__name__}"
-                await bb.update_task(
-                    db, task, status=AuditTaskStatus.FAILED.value,
-                    result_summary=failure[:500],
-                )
-                logger.warning("Deep Audit task failed run=%s task=%s: %s", run_id, task.id, type(exc).__name__)
-            finally:
-                await bb.update_run(db, run, budget_usage=ledger.snapshot())
 
-        cancelled = cancelled or run_id in _cancel_requested
-        if cancelled:
+        exhausted = ledger.exhausted_dimension
+        if run_id in _cancel_requested:
             final_status = AuditRunStatus.CANCELLED.value
             message = "用户取消；已保存事实与证据保留"
+        elif source_changed:
+            final_status = AuditRunStatus.FAILED.value
+            message = "扫描源码版本已变化，请启动新的 Deep Audit 运行"
         elif exhausted:
             final_status = AuditRunStatus.FAILED.value
             message = f"预算维度 {exhausted} 耗尽，已保存事实与证据保留"
-        elif failure:
-            final_status = AuditRunStatus.FAILED.value
-            message = failure
         elif role_failures:
             final_status = AuditRunStatus.FAILED.value
-            message = f"Worker 角色预算耗尽：{'、'.join(sorted(role_failures))}"
+            message = "部分任务未有效完成；其他任务结果已保存"
         else:
             final_status = AuditRunStatus.COMPLETED.value
             message = None
@@ -446,6 +439,66 @@ async def _execute_run_inner(run_id: int, *, use_llm: bool = False, repo: ReadOn
             {"run_id": run_id, "status": final_status,
              "exhausted_dimension": exhausted, "budget": ledger.snapshot()},
         )
+
+
+async def execute_audit_task(
+    run_id: int, task_id: int, repo: ReadOnlyRepository, ledger: BudgetLedger,
+    worker: RoleConfig | AgentDefinition | None, use_llm: bool, digest: str, cutoff: int,
+    stop_batch: asyncio.Event,
+) -> str:
+    """Each task owns its session. Writes are short and serialized within this run."""
+    def check():
+        check_cancel(run_id)
+        if stop_batch.is_set():
+            raise RepositoryChanged("运行期间源码版本已变化")
+
+    async with async_session() as db:
+        run = await db.get(AuditRun, run_id)
+        task = await db.get(AuditTask, task_id)
+        if run is None or task is None:
+            return "failed"
+        policy = BudgetPolicy(**worker.policy) if isinstance(worker, RoleConfig) else ledger.policy
+        handle = ledger.handle(f"worker:{task.agent_id}", policy)
+        status = AuditTaskStatus.FAILED.value
+        previous = _loads(task.budget_usage, {})
+        coverage, summary, result = "exception", "", "failed"
+        try:
+            async with ledger.write_lock:
+                check()
+                await bb.update_task(db, task, status=AuditTaskStatus.RUNNING.value)
+            outcome = await run_worker_task(
+                db, run=run, task=task, repo=repo, policy=policy,
+                ledger=handle, agent=worker, cancel_check=check, use_llm=use_llm,
+                shared_digest=digest, visible_through=cutoff,
+            )
+            coverage, summary = outcome.coverage, outcome.summary()
+            if coverage in {"covered", "deterministic_verified", "deterministic_uncovered"}:
+                status, result = AuditTaskStatus.COMPLETED.value, "completed"
+        except DeepAuditCancelled:
+            status, coverage, summary, result = AuditTaskStatus.PENDING.value, "cancelled", "已取消，已保存证据可恢复", "cancelled"
+        except RepositoryChanged as exc:
+            stop_batch.set()
+            coverage, summary, result = "source_changed", str(exc), "source_changed"
+        except (RoleBudgetExceeded, BudgetExceeded) as exc:
+            coverage, summary = "budget_exhausted", str(exc)
+        except Exception as exc:
+            logger.warning("Deep Audit task failed run=%s task=%s: %s", run_id, task_id, type(exc).__name__)
+            coverage, summary = "exception", f"任务异常：{type(exc).__name__}"
+            await db.rollback()
+            run = await db.get(AuditRun, run_id)
+            task = await db.get(AuditTask, task_id)
+
+        async with ledger.write_lock:
+            if run_id in _cancel_requested:
+                status, coverage, summary, result = AuditTaskStatus.PENDING.value, "cancelled", "已取消，已保存证据可恢复", "cancelled"
+            usage = {key: (previous.get(key) or 0) + value for key, value in handle.usage.items()
+                     if not previous.get("policy")}
+            if previous.get("policy"):
+                usage = dict(handle.usage)
+            await bb.update_task(db, task, status=status, result_summary=summary,
+                                 budget_usage={**usage, "coverage": coverage})
+            await bb.update_run(db, run, budget_usage=ledger.snapshot())
+        return result
 
 
 async def resume_run(run_id: int, *, use_llm: bool | None = None) -> AuditRun | None:
